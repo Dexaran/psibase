@@ -1,5 +1,5 @@
 #include <boost/core/demangle.hpp>
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <iostream>
 #include <psio/from_bin.hpp>
 #include <psio/graphql.hpp>
@@ -27,6 +27,7 @@ namespace psio
    {
       Node        node;
       std::string cursor;
+      PSIO_REFLECT(Edge, node, cursor)
    };
 
    template <typename Node, FixedString EdgeName>
@@ -34,49 +35,6 @@ namespace psio
    {
       return EdgeName.c_str();
    }
-
-   struct ReflectEdge
-   {
-      static constexpr bool is_defined = true;
-      static constexpr bool is_struct  = true;
-      template <typename L>
-      constexpr inline static void for_each(L&& lambda)
-      {
-         {
-            auto off = ~uint64_t(0);
-            (void)lambda(psio::meta{.name = "node", .offset = off, .number = 0 + 1},
-                         [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::node)
-                         { return &psio::remove_cvref_t<decltype(*p)>::node; });
-         }
-         {
-            auto off = ~uint64_t(0);
-            (void)lambda(psio::meta{.name = "cursor", .offset = off, .number = 1 + 1},
-                         [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::cursor)
-                         { return &psio::remove_cvref_t<decltype(*p)>::cursor; });
-         }
-      }
-      template <typename L>
-      inline static bool get_by_name(uint64_t n, L&& lambda)
-      {
-         switch (n)
-         {
-            case psio::hash_name("node"):
-               (void)lambda(psio::meta{.name = "node", .number = 0 + 1},
-                            [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::node)
-                            { return &psio::remove_cvref_t<decltype(*p)>::node; });
-               return true;
-            case psio::hash_name("cursor"):
-               (void)lambda(psio::meta{.name = "cursor", .number = 1 + 1},
-                            [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::cursor)
-                            { return &psio::remove_cvref_t<decltype(*p)>::cursor; });
-               return true;
-         }
-         return false;
-      }
-   };  // ReflectEdge
-
-   template <typename Node, FixedString EdgeName>
-   ReflectEdge get_reflect_impl(const Edge<Node, EdgeName>&);
 
    template <typename Node, FixedString ConnectionName, FixedString EdgeName>
    struct Connection
@@ -86,6 +44,7 @@ namespace psio
 
       std::vector<Edge> edges;
       PageInfo          pageInfo;
+      PSIO_REFLECT(Connection, edges, pageInfo)
    };
 
    template <typename Node, FixedString ConnectionName, FixedString EdgeName>
@@ -93,49 +52,6 @@ namespace psio
    {
       return ConnectionName.c_str();
    }
-
-   struct ReflectConnection
-   {
-      static constexpr bool is_defined = true;
-      static constexpr bool is_struct  = true;
-      template <typename L>
-      constexpr inline static void for_each(L&& lambda)
-      {
-         {
-            auto off = ~uint64_t(0);
-            (void)lambda(psio::meta{.name = "edges", .offset = off, .number = 0 + 1},
-                         [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::edges)
-                         { return &psio::remove_cvref_t<decltype(*p)>::edges; });
-         }
-         {
-            auto off = ~uint64_t(0);
-            (void)lambda(psio::meta{.name = "pageInfo", .offset = off, .number = 1 + 1},
-                         [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::pageInfo)
-                         { return &psio::remove_cvref_t<decltype(*p)>::pageInfo; });
-         }
-      }
-      template <typename L>
-      inline static bool get_by_name(uint64_t n, L&& lambda)
-      {
-         switch (n)
-         {
-            case psio::hash_name("edges"):
-               (void)lambda(psio::meta{.name = "edges", .number = 0 + 1},
-                            [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::edges)
-                            { return &psio::remove_cvref_t<decltype(*p)>::edges; });
-               return true;
-            case psio::hash_name("pageInfo"):
-               (void)lambda(psio::meta{.name = "pageInfo", .number = 1 + 1},
-                            [](auto p) -> decltype(&psio::remove_cvref_t<decltype(*p)>::pageInfo)
-                            { return &psio::remove_cvref_t<decltype(*p)>::pageInfo; });
-               return true;
-         }
-         return false;
-      }
-   };  // ReflectConnection
-
-   template <typename Node, FixedString ConnectionName, FixedString EdgeName>
-   ReflectConnection get_reflect_impl(const Connection<Node, ConnectionName, EdgeName>&);
 
    // To enable cursors to function correctly, container must not have duplicate keys
    template <typename Connection,
@@ -251,7 +167,7 @@ struct InputArg
    std::string one;
    std::string two;
 };
-PSIO_REFLECT(InputArg, method(one), method(two))
+PSIO_REFLECT(InputArg, one, two)
 
 struct Account
 {
@@ -293,13 +209,13 @@ struct Root
 };
 
 PSIO_REFLECT(Root,
-             method(world),
-             method(hello),
+             world,
+             hello,
              method(sum, a, b),
              method(cat, arg),
              method(getAccounts, first, before, last, after))
 
-TEST_CASE("graphql")
+TEST_CASE("graphql", "[graphql]")
 {
    Root r{"hello", 42};
 
@@ -324,4 +240,151 @@ TEST_CASE("graphql")
        "{ accounts:getAccounts( last: 2 ) { pageInfo { hasPreviousPage, hasNextPage }, "
        "edges { node {firstName, lastName } } }  }",
        "");
+}
+
+TEST_CASE("graphql_escape_sequences", "[graphql]")
+{
+   Root r{"hello", 42};
+
+   // Test all escape sequences
+   auto result1 =
+       psio::gql_query(r, R"({ cat(arg: { one: "Hello\n\t\b\f\r\"\\\/", two: "World" }) })", "");
+   REQUIRE(result1 == R"({"data": {"cat":"Hello\n\t\b\f\r\"\\/World"}})");
+
+   // Test Unicode escape sequences
+   auto result2 = psio::gql_query(
+       r, R"({ cat(arg: { one: "\u0048\u0065\u006C\u006C\u006F", two: "World" }) })", "");
+   REQUIRE(result2 == R"({"data": {"cat":"HelloWorld"}})");
+
+   // Test that unknown escape sequences result in an error
+   auto result3 = psio::gql_query(r, R"({ cat(arg: { one: "Hello\x", two: "World" }) })", "");
+   REQUIRE(result3 == R"({"errors": {"message": "expected }"}})");
+
+   // Test empty string followed by quote (should be valid)
+   auto result4 = psio::gql_query(r, R"({ cat(arg: { one: "", two: "\"" }) })", "");
+   REQUIRE(result4 == R"({"data": {"cat":"\""}})");
+
+   // Test 2-byte Unicode character (ñ = U+00F1)
+   auto result5 = psio::gql_query(r, R"({ cat(arg: { one: "Ma\u00F1ana", two: "" }) })", "");
+   REQUIRE(result5 == R"({"data": {"cat":"Mañana"}})");
+
+   // Test 3-byte Unicode character (€ = U+20AC)
+   auto result6 = psio::gql_query(r, R"({ cat(arg: { one: "\u20AC100", two: "" }) })", "");
+   REQUIRE(result6 == R"({"data": {"cat":"€100"}})");
+
+   // Test 4-byte Unicode character using surrogate pair (🚀 = U+1F680)
+   auto result7 = psio::gql_query(r, R"({ cat(arg: { one: "Launch\uD83D\uDE80", two: "" }) })", "");
+   REQUIRE(result7 == R"({"data": {"cat":"Launch🚀"}})");
+
+   // Test invalid surrogate pair (high surrogate without low surrogate)
+   auto result8 = psio::gql_query(r, R"({ cat(arg: { one: "\uD83D", two: "" }) })", "");
+   REQUIRE(result8 == R"({"errors": {"message": "expected }"}})");
+
+   // Test invalid surrogate pair (low surrogate without high surrogate)
+   auto result9 = psio::gql_query(r, R"({ cat(arg: { one: "\uDE80", two: "" }) })", "");
+   REQUIRE(result9 == R"({"errors": {"message": "expected }"}})");
+}
+
+TEST_CASE("graphql_block_strings", "[graphql]")
+{
+   Root r{"hello", 42};
+
+   // Test basic block string with backslash and quotes (should be preserved verbatim)
+   auto result1 =
+       psio::gql_query(r, R"({ cat(arg: { one: """Hello \n "quoted" World!""", two: "" }) })", "");
+   REQUIRE(result1 == R"({"data": {"cat":"Hello \\n \"quoted\" World!"}})");
+
+   // Test common indentation removal
+   auto result2 = psio::gql_query(r, R"({ cat(arg: { one: """
+        Hello
+          World
+        Goodbye
+    """, two: "" }) })",
+                                  "");
+   REQUIRE(result2 == R"({"data": {"cat":"Hello\n  World\nGoodbye"}})");
+
+   // Test empty lines at start and end are removed
+   auto result3 = psio::gql_query(r, R"({ cat(arg: { one: """
+
+        Hello
+        World
+
+    """, two: "" }) })",
+                                  "");
+   REQUIRE(result3 == R"({"data": {"cat":"Hello\nWorld"}})");
+
+   // Test escaped triple quotes
+   auto result4 =
+       psio::gql_query(r, R"({ cat(arg: { one: """Hello \""" World""", two: "" }) })", "");
+   REQUIRE(result4 == R"({"data": {"cat":"Hello \"\"\" World"}})");
+
+   // Test mixed line endings (CRLF and LF)
+   auto result5 = psio::gql_query(
+       r, "{ cat(arg: { one: \"\"\"\r\nHello\rWorld\nGoodbye\r\n\"\"\", two: \"\" }) }", "");
+   REQUIRE(result5 == R"({"data": {"cat":"Hello\nWorld\nGoodbye"}})");
+
+   // Test empty block string
+   auto result6 = psio::gql_query(r, R"({ cat(arg: { one: """""", two: "" }) })", "");
+   REQUIRE(result6 == R"({"data": {"cat":""}})");
+
+   // Test whitespace-only lines don't affect common indentation
+   auto result7 = psio::gql_query(r, R"({ cat(arg: { one: """
+        Hello
+             
+          World
+        """, two: "" }) })",
+                                  "");
+   REQUIRE(result7 == R"({"data": {"cat":"Hello\n     \n  World"}})");
+
+   // Test tab indentation
+   auto result8 = psio::gql_query(r, R"({ cat(arg: { one: """
+		Hello
+			World
+		Goodbye
+""", two: "" }) })",
+                                  "");
+   REQUIRE(result8 == R"({"data": {"cat":"Hello\n\tWorld\nGoodbye"}})");
+
+   // Test mixed space and tab indentation
+   auto result9 = psio::gql_query(r, R"({ cat(arg: { one: """
+	    Hello
+	      World
+	    Goodbye
+""", two: "" }) })",
+                                  "");
+   REQUIRE(result9 == R"({"data": {"cat":"Hello\n  World\nGoodbye"}})");
+
+   // Test non-printable ASCII characters are preserved
+   auto result10 =
+       psio::gql_query(r, R"({ cat(arg: { one: """Hello\u0007World""", two: "" }) })", "");
+   REQUIRE(result10 == R"({"data": {"cat":"Hello\\u0007World"}})");
+
+   // Test multiple consecutive empty lines in the middle
+   auto result11 = psio::gql_query(r, R"({ cat(arg: { one: """
+        Hello
+
+
+        World
+    """, two: "" }) })",
+                                   "");
+   REQUIRE(result11 == R"({"data": {"cat":"Hello\n\n\nWorld"}})");
+
+   // Test lines with only whitespace in the middle
+   auto result12 = psio::gql_query(r, R"({ cat(arg: { one: """
+        Hello
+        
+           
+        World
+    """, two: "" }) })",
+                                   "");
+   REQUIRE(result12 == R"({"data": {"cat":"Hello\n\n   \nWorld"}})");
+
+   // Test lines with mixed tabs and spaces for indentation
+   auto result13 = psio::gql_query(r, R"({ cat(arg: { one: """
+        Hello
+	    	World
+        	Goodbye
+    """, two: "" }) })",
+                                   "");
+   REQUIRE(result13 == R"({"data": {"cat":"  Hello\nWorld\n  \tGoodbye"}})");
 }

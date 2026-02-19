@@ -1,0 +1,133 @@
+#pragma once
+
+#include <psibase/Service.hpp>
+#include <psibase/Table.hpp>
+#include <psibase/nativeTables.hpp>
+#include <services/system/Transact.hpp>
+
+namespace SystemService
+{
+
+   struct CandidateInfo
+   {
+      psibase::AccountNumber account;
+      std::string            endpoint;
+      psibase::Claim         claim;
+   };
+   PSIO_REFLECT(CandidateInfo, account, endpoint, claim)
+   using CandidateInfoTable = psibase::Table<CandidateInfo, &CandidateInfo::account>;
+   PSIO_REFLECT_TYPENAME(CandidateInfoTable)
+
+   struct ProdsConfig
+   {
+      uint8_t maxProds;
+   };
+   PSIO_REFLECT(ProdsConfig, maxProds)
+   using ProdsConfigTable = psibase::Table<ProdsConfig, psibase::SingletonKey{}>;
+   PSIO_REFLECT_TYPENAME(ProdsConfigTable)
+
+   // This service manages the active producers.
+   // It must have native write permission
+   class Producers : public psibase::Service
+   {
+     public:
+      static constexpr auto service      = psibase::AccountNumber("producers");
+      static constexpr auto serviceFlags = psibase::CodeRow::isPrivileged;
+
+      static constexpr uint8_t DEFAULT_MAX_PRODS = 13;
+
+      using Tables = psibase::ServiceTables<CandidateInfoTable, ProdsConfigTable>;
+
+      /// `prods-weak` and `prods-strong` are accounts that represent authorization
+      /// by the current block producers.  `prods-weak` is a quorum that is sufficient
+      /// to guarantee inclusion of at least one honest producer.  i.e, it is one more
+      /// than the maximum number of dishonest producers that the current consensus
+      /// settings can tolerate. This is useful for actions that cannot conflict or
+      /// for which conflicts are resolved by an off-chain process.
+      ///
+      /// `prods-strong` provides the additional guarantee that if two actions are
+      /// both authorized by `prods-strong`, there is at least one honest producer
+      /// that authorized both actions. It should generally be preferred over `prods-weak`.
+      ///
+      /// |        | cft       | bft        |
+      /// |--------|-----------|------------|
+      /// | weak   | 1         | ⌈n/3⌉      |
+      /// | strong | ⌊n/2⌋ + 1 | ⌊2n/3⌋ + 1 |
+      static constexpr auto producerAccountWeak   = psibase::AccountNumber("prods-weak");
+      static constexpr auto producerAccountStrong = psibase::AccountNumber("prods-strong");
+
+      void setConsensus(psibase::ConsensusData consensus);
+      void setProducers(std::vector<psibase::Producer> prods);
+      void regCandidate(const std::string& endpoint, psibase::Claim claim);
+      void unregCand();
+
+      std::vector<psibase::AccountNumber> getProducers();
+
+      /// A maximum size of the producer set producing blocks for the network
+      void    setMaxProds(uint8_t maxProds);
+      uint8_t getMaxProds();
+
+      uint32_t getThreshold(psibase::AccountNumber account);
+      uint32_t antiThreshold(psibase::AccountNumber account);
+
+      // Allows this service to be used as an auth service for `prods-weak` and `prods-strong`.
+      void checkAuthSys(uint32_t                    flags,
+                        psibase::AccountNumber      requester,
+                        psibase::AccountNumber      sender,
+                        ServiceMethod               action,
+                        std::vector<ServiceMethod>  allowedActions,
+                        std::vector<psibase::Claim> claims);
+      void canAuthUserSys(psibase::AccountNumber user);
+
+      /// Check whether a specified set of authorizer accounts are sufficient to authorize sending a
+      /// transaction from a specified sender.
+      ///
+      /// * `sender`: The sender account for the transaction potentially being authorized.
+      /// * `authorizers`: The set of accounts that have already authorized the execution of the transaction.
+      /// * `authSet`: The set of accounts that are already being checked for authorization. If
+      ///              the sender is already in this set, then the function should return false.
+      ///
+      /// Returns:
+      /// * `true`: If the total authorizations from `authorizers` or their auth services meets sender's threshold
+      /// * `false`: If not returning true, or on recursive checks for the same sender
+      bool isAuthSys(psibase::AccountNumber                             sender,
+                     std::vector<psibase::AccountNumber>                authorizers,
+                     std::optional<ServiceMethod>                       method,
+                     std::optional<std::vector<psibase::AccountNumber>> authSet);
+
+      /// Check whether a specified set of rejecter accounts are sufficient to reject (cancel) a
+      /// transaction from a specified sender.
+      ///
+      /// * `sender`: The sender account for the transaction potentially being rejected.
+      /// * `rejecters`: The set of accounts that have already authorized the rejection of the transaction.
+      /// * `authSet`: The set of accounts that are already being checked for authorization. If
+      ///              the sender is already in this set, then the function should return false.
+      ///
+      /// Returns:
+      /// * `true`: If the total authorizations from `rejecters` or their auth services meets sender's threshold
+      /// * `false`: If not returning true, or on recursive checks for the same sender
+      bool isRejectSys(psibase::AccountNumber                             sender,
+                       std::vector<psibase::AccountNumber>                rejecters,
+                       std::optional<ServiceMethod>                       method,
+                       std::optional<std::vector<psibase::AccountNumber>> authSet);
+   };
+   PSIO_REFLECT(Producers,
+                method(setConsensus, consensus),
+                method(setProducers, producers),
+                method(regCandidate, endpoint, claim),
+                method(unregCand),
+                method(getProducers),
+                method(setMaxProds, maxProds),
+                method(getMaxProds),
+                method(getThreshold, account),
+                method(antiThreshold, account),
+                method(checkAuthSys, flags, requester, sender, action, allowedActions, claims),
+                method(canAuthUserSys, user),
+                method(isAuthSys, sender, authorizers, method, authSet),
+                method(isRejectSys, sender, rejecters, method, authSet)
+                //
+   )
+
+   PSIBASE_REFLECT_TABLES(Producers, Producers::Tables)
+
+}  // namespace SystemService

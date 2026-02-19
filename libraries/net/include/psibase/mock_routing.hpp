@@ -1,6 +1,11 @@
 #pragma once
 
+#include <psibase/log.hpp>
+#include <psibase/message_serializer.hpp>
+#include <psibase/mock_timer.hpp>
+
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
 #include <cassert>
 #include <deque>
 #include <functional>
@@ -13,61 +18,151 @@ namespace psibase::net
    struct mock_network;
 
    template <typename Derived>
-   struct mock_routing
+   struct mock_routing : message_serializer<Derived>
    {
-      template <typename Msg, typename F>
-      void async_send_block(peer_id id, const Msg& msg, F&& f)
+      using DeferredMessageKey = std::tuple<peer_id, Checksum256>;
+      struct peer_info
       {
-         if (_network)
-         {
-            auto peer = _peers.find(id);
-            if (peer == _peers.end())
-            {
-               throw std::runtime_error("unknown peer");
-            }
-            std::cout << std::to_string(static_cast<Derived*>(this)->producer_name()) << "->"
-                      << std::to_string(static_cast<Derived*>(peer->second.first)->producer_name())
-                      << ": ";
-            _network->log(msg);
-            _network->ctx.post(
-                [msg, peer = &*peer, id, this]()
+         mock_routing*              ptr;
+         peer_id                    rid;
+         test::mock_clock::duration latency;
+      };
+      explicit mock_routing(boost::asio::io_context& ctx) : ctx(ctx)
+      {
+         logger.add_attribute("Channel", boost::log::attributes::constant(std::string("p2p")));
+      }
+      void on_producer_change() {}
+      void post_recv(peer_id origin, const auto& msg)
+      {
+         boost::asio::post(
+             ctx,
+             [msg, this, origin]()
+             {
+                if (auto iter = _peers.find(origin); iter != _peers.end())
                 {
-                   if (_peers.find(id) != _peers.end())
-                   {
-                      static_cast<Derived*>(peer->second.first)->recv(peer->second.second, msg);
-                   }
-                });
-            _network->ctx.post([f]() { f(std::error_code()); });
+                   PSIBASE_LOG(logger, debug)
+                       << static_cast<Derived*>(iter->second.ptr)->producer_name().str() << "->"
+                       << static_cast<Derived*>(this)->producer_name().str() << ": "
+                       << msg.to_string() << std::endl;
+                   static_cast<Derived*>(this)->recv(origin, maybe_sign_message(msg));
+                }
+             });
+      }
+      template <typename T>
+      static auto maybe_sign_message(const T& message)
+      {
+         if constexpr (has_recv<SignedMessage<T>, Derived>)
+         {
+            return SignedMessage<T>{message};
          }
+         else
+         {
+            return message;
+         }
+      }
+      void send(const peer_info& peer, const auto& message)
+      {
+         if (peer.latency == test::mock_clock::duration())
+         {
+            peer.ptr->post_recv(peer.rid, message);
+         }
+         else
+         {
+            defer.post_after(ctx, peer.latency,
+                             [ptr = peer.ptr, origin = peer.rid, message](const std::error_code&)
+                             { ptr->post_recv(origin, message); });
+         }
+      }
+      template <typename Msg>
+      void async_send(peer_id id, const Msg& msg)
+      {
+         auto peer = _peers.find(id);
+         if (peer == _peers.end())
+         {
+            throw std::runtime_error("unknown peer");
+         }
+         send(peer->second, msg);
+      }
+      template <typename Msg, typename F>
+      void async_send(peer_id id, const Msg& msg, F&& f)
+      {
+         async_send(id, msg);
+         boost::asio::post(ctx, [f]() { f(std::error_code()); });
       }
       template <typename Msg>
       void multicast_producers(const Msg& msg)
       {
-         if (_network)
+         multicast(msg);
+      }
+      template <typename Msg>
+      void multicast_producers(const Checksum256& blockid, const Msg& msg)
+      {
+         multicast(blockid, msg);
+      }
+      template <typename Msg>
+      void multicast(const Msg& msg)
+      {
+         for (const auto& [id, peer] : _peers)
          {
-            _network->multicast_producers(msg);
+            send(peer, msg);
          }
       }
       template <typename Msg>
-      void broadcast(const Msg& msg)
+      void multicast(const Checksum256& blockid, const Msg& msg)
       {
-         if (_network)
+         for (const auto& [id, peer] : _peers)
          {
-            _network->broadcast(msg);
+            send_after_block(id, blockid, msg);
          }
+      }
+      template <typename Msg>
+      void send_after_block(peer_id peer, const Checksum256& blockid, const Msg& msg)
+      {
+         if (static_cast<Derived*>(this)->consensus().peer_has_block(peer, blockid))
+         {
+            async_send(peer, msg);
+         }
+         else
+         {
+            deferredMessages.try_emplace({peer, blockid},
+                                         [this, peer, msg] { async_send(peer, msg); });
+         }
+      }
+      void on_peer_block(peer_id peer, const Checksum256& blockid)
+      {
+         auto r = deferredMessages.equal_range({peer, blockid});
+         for (const auto& [k, f] : std::ranges::subrange(r.first, r.second))
+         {
+            f();
+         }
+         deferredMessages.erase(r.first, r.second);
       }
       template <typename Msg>
       void sendto(producer_id producer, const Msg& msg)
       {
-         if (_network)
+         for (const auto& [id, peer] : _peers)
          {
-            _network->sendto(producer, msg);
+            if (static_cast<Derived*>(peer.ptr)->producer_name() == producer)
+            {
+               send(peer, msg);
+            }
          }
       }
-      void add_peer(mock_routing* other)
+      bool is_reachable(producer_id producer) const
       {
-         auto* p1 = add_peer_impl(other);
-         auto* p2 = other->add_peer_impl(this);
+         for (const auto& [id, peer] : _peers)
+         {
+            if (static_cast<Derived*>(peer.ptr)->producer_name() == producer)
+            {
+               return true;
+            }
+         }
+         return false;
+      }
+      void add_peer(mock_routing* other, test::mock_clock::duration latency = {})
+      {
+         auto* p1 = add_peer_impl(other, latency);
+         auto* p2 = other->add_peer_impl(this, latency);
          std::swap(*p1, *p2);
          static_cast<Derived*>(this)->consensus().connect(*p2);
          static_cast<Derived*>(other)->consensus().connect(*p1);
@@ -76,103 +171,42 @@ namespace psibase::net
       {
          for (auto [id, data] : _peers)
          {
-            if (data.first == other)
+            if (data.ptr == other)
             {
                _peers.erase(id);
-               other->_peers.erase(data.second);
+               other->_peers.erase(data.rid);
                static_cast<Derived*>(this)->consensus().disconnect(id);
-               static_cast<Derived*>(other)->consensus().disconnect(data.second);
+               static_cast<Derived*>(other)->consensus().disconnect(data.rid);
                return;
             }
          }
          assert(!"Unknown peer");
       }
-      peer_id* add_peer_impl(mock_routing* other)
+      bool has_peer(mock_routing* other)
+      {
+         for (const auto& [id, data] : _peers)
+         {
+            if (data.ptr == other)
+            {
+               return true;
+            }
+         }
+         return false;
+      }
+      peer_id* add_peer_impl(mock_routing* other, test::mock_clock::duration latency)
       {
          peer_id id    = next_peer_id++;
-         auto [pos, _] = _peers.insert({id, {other, id}});
-         return &pos->second.second;
+         auto [pos, _] = _peers.insert({id, {other, id, latency}});
+         return &pos->second.rid;
       }
-      mock_network<Derived>*                               _network     = nullptr;
-      peer_id                                              next_peer_id = 0;
-      std::map<peer_id, std::pair<mock_routing*, peer_id>> _peers;
+      boost::asio::io_context&     ctx;
+      test::mock_execution_context defer;
+      peer_id                      next_peer_id = 0;
+      std::map<peer_id, peer_info> _peers;
+      loggers::common_logger       logger;
+      // Stores messages that should be sent to a peer after the
+      // peer is known to have a particular block.
+      std::map<DeferredMessageKey, std::function<void()>> deferredMessages;
    };
 
-   template <typename Node>
-   struct mock_network
-   {
-      mock_network(boost::asio::io_context& ctx) : ctx(ctx) {}
-      template <typename Msg>
-      void log(const Msg& msg)
-      {
-         std::cout << msg.to_string() << std::endl;
-      }
-      template <typename Msg>
-      void multicast_producers(const Msg& msg)
-      {
-         log(msg);
-         post(
-             [this, msg]()
-             {
-                for (auto* node : nodes)
-                {
-                   if (node->is_producer())
-                   {
-                      node->recv(msg);
-                   }
-                }
-             });
-      }
-      template <typename Msg>
-      void broadcast(const Msg& msg)
-      {
-         log(msg);
-         post(
-             [this, msg]()
-             {
-                for (auto* node : nodes)
-                {
-                   if (node->is_producer())
-                   {
-                      node->recv(msg);
-                   }
-                }
-             });
-      }
-      template <typename Msg>
-      void sendto(producer_id prod, const Msg& msg)
-      {
-         log(msg);
-         post(
-             [this, msg, prod]()
-             {
-                for (auto* node : nodes)
-                {
-                   if (node->is_producer() && node->producer_name() == prod)
-                   {
-                      node->recv(msg);
-                   }
-                }
-             });
-      }
-      template <typename F>
-      void post(F&& f)
-      {
-         ctx.post(std::forward<F>(f));
-      }
-      void add(Node* n)
-      {
-         assert(n->_network == nullptr);
-         n->_network = this;
-         nodes.push_back(n);
-      }
-      void remove(Node* n)
-      {
-         assert(n->_network == this);
-         n->_network = nullptr;
-         nodes.erase(std::find(nodes.begin(), nodes.end(), n));
-      }
-      boost::asio::io_context& ctx;
-      std::vector<Node*>       nodes;
-   };
 }  // namespace psibase::net

@@ -1,13 +1,17 @@
-use crate::{reflect, ToKey};
-use std::fmt::Debug;
+use crate::ToKey;
+use async_graphql::{InputValueError, InputValueResult, Scalar, ScalarType};
+use fracpack::{AnyType, FracInputStream, SchemaBuilder, ToSchema};
+use std::convert::AsRef;
+use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::str::FromStr;
 
-trait ToHex:
-    Sized + Debug + Clone + PartialEq + Eq + PartialOrd + Ord + reflect::Reflect + ToKey
-{
+trait ToHex: Sized + Debug + Clone + PartialEq + Eq + PartialOrd + Ord + ToKey {
     fn to_hex(&self) -> String;
 }
+
+pub type HexBytes = Hex<Vec<u8>>;
 
 trait FromHex: ToHex {
     fn from_hex(s: &str) -> Option<Self>;
@@ -17,10 +21,8 @@ trait FromHex: ToHex {
 ///
 /// `Hex<Vec<u8>>`, `Hex<&[u8]>`, and `Hex<[u8; SIZE]>` store binary
 /// data. This wrapper does not support other inner types.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Hex<T>(pub T)
-where
-    T: Debug + Clone + PartialEq + Eq + PartialOrd + Ord;
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Hex<T>(pub T);
 
 impl<T> Default for Hex<T>
 where
@@ -50,6 +52,38 @@ where
     }
 }
 
+impl<T: ToSchema + 'static> ToSchema for Hex<T> {
+    fn schema(builder: &mut SchemaBuilder) -> AnyType {
+        AnyType::Custom {
+            type_: builder.insert::<T>().into(),
+            id: "hex".to_string(),
+        }
+    }
+}
+
+impl<T> Display for Hex<T>
+where
+    T: ToHex,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+impl<T> FromStr for Hex<T>
+where
+    T: FromHex,
+{
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(v) = T::from_hex(s) {
+            Ok(Self(v))
+        } else {
+            Err("Hex conversion failed")
+        }
+    }
+}
+
 impl<'a, const SIZE: usize> From<&'a [u8; SIZE]> for Hex<&'a [u8]> {
     fn from(inner: &'a [u8; SIZE]) -> Self {
         Self(inner)
@@ -62,24 +96,12 @@ impl From<String> for Hex<Vec<u8>> {
     }
 }
 
-impl reflect::Reflect for Hex<Vec<u8>> {
-    type StaticType = Self;
-    fn reflect<V: reflect::Visitor>(visitor: V) -> V::Return {
-        visitor.builtin::<Hex<Vec<u8>>>("hex")
-    }
-}
-
-impl<'a> reflect::Reflect for Hex<&'a [u8]> {
-    type StaticType = Hex<&'static [u8]>;
-    fn reflect<V: reflect::Visitor>(visitor: V) -> V::Return {
-        visitor.builtin::<Hex<&'a [u8]>>("hex")
-    }
-}
-
-impl<const SIZE: usize> reflect::Reflect for Hex<[u8; SIZE]> {
-    type StaticType = Self;
-    fn reflect<V: reflect::Visitor>(visitor: V) -> V::Return {
-        visitor.hex::<SIZE>()
+impl AsRef<[u8]> for Hex<Vec<u8>>
+where
+    <Hex<Vec<u8>> as Deref>::Target: AsRef<[u8]>,
+{
+    fn as_ref(&self) -> &[u8] {
+        self.deref().as_ref()
     }
 }
 
@@ -129,46 +151,41 @@ where
     const FIXED_SIZE: u32 = <T as crate::fracpack::Unpack>::FIXED_SIZE;
     const VARIABLE_SIZE: bool = <T as crate::fracpack::Unpack>::VARIABLE_SIZE;
     const IS_OPTIONAL: bool = <T as crate::fracpack::Unpack>::IS_OPTIONAL;
-    fn unpack(src: &'a [u8], pos: &mut u32) -> crate::fracpack::Result<Self> {
-        let value = <T as crate::fracpack::Unpack>::unpack(src, pos)?;
+    fn unpack(src: &mut FracInputStream<'a>) -> crate::fracpack::Result<Self> {
+        let value = <T as crate::fracpack::Unpack>::unpack(src)?;
         Ok(Self(value))
     }
-    fn verify(src: &'a [u8], pos: &mut u32) -> crate::fracpack::Result<()> {
-        <T as crate::fracpack::Unpack>::verify(src, pos)
+    fn verify(src: &mut FracInputStream) -> crate::fracpack::Result<()> {
+        <T as crate::fracpack::Unpack>::verify(src)
     }
     fn new_empty_container() -> crate::fracpack::Result<Self> {
         Ok(Self(<T as crate::fracpack::Unpack>::new_empty_container()?))
     }
     fn embedded_variable_unpack(
-        src: &'a [u8],
+        src: &mut FracInputStream<'a>,
         fixed_pos: &mut u32,
-        heap_pos: &mut u32,
     ) -> crate::fracpack::Result<Self> {
-        let value =
-            <T as crate::fracpack::Unpack>::embedded_variable_unpack(src, fixed_pos, heap_pos)?;
+        let value = <T as crate::fracpack::Unpack>::embedded_variable_unpack(src, fixed_pos)?;
         Ok(Self(value))
     }
     fn embedded_unpack(
-        src: &'a [u8],
+        src: &mut FracInputStream<'a>,
         fixed_pos: &mut u32,
-        heap_pos: &mut u32,
     ) -> crate::fracpack::Result<Self> {
-        let value = <T as crate::fracpack::Unpack>::embedded_unpack(src, fixed_pos, heap_pos)?;
+        let value = <T as crate::fracpack::Unpack>::embedded_unpack(src, fixed_pos)?;
         Ok(Self(value))
     }
     fn embedded_variable_verify(
-        src: &'a [u8],
+        src: &mut FracInputStream,
         fixed_pos: &mut u32,
-        heap_pos: &mut u32,
     ) -> crate::fracpack::Result<()> {
-        <T as crate::fracpack::Unpack>::embedded_variable_verify(src, fixed_pos, heap_pos)
+        <T as crate::fracpack::Unpack>::embedded_variable_verify(src, fixed_pos)
     }
     fn embedded_verify(
-        src: &'a [u8],
+        src: &mut FracInputStream,
         fixed_pos: &mut u32,
-        heap_pos: &mut u32,
     ) -> crate::fracpack::Result<()> {
-        <T as crate::fracpack::Unpack>::embedded_verify(src, fixed_pos, heap_pos)
+        <T as crate::fracpack::Unpack>::embedded_verify(src, fixed_pos)
     }
 }
 
@@ -186,8 +203,8 @@ where
     T: FromHex,
 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor<'a, T>(&'a mut String, PhantomData<T>);
-        impl<'de, 'a, T> serde::de::Visitor<'de> for Visitor<'a, T>
+        struct Visitor<T>(PhantomData<T>);
+        impl<'de, T> serde::de::Visitor<'de> for Visitor<T>
         where
             T: FromHex,
         {
@@ -201,8 +218,25 @@ where
                 ))
             }
         }
-        let mut s = String::new();
-        deserializer.deserialize_str(Visitor::<T>(&mut s, PhantomData))
+        deserializer.deserialize_str(Visitor::<T>(PhantomData))
+    }
+}
+
+#[Scalar]
+impl<T> ScalarType for Hex<T>
+where
+    T: FromHex + Send + Sync,
+{
+    fn parse(value: async_graphql::Value) -> InputValueResult<Self> {
+        if let async_graphql::Value::String(value) = &value {
+            Ok(value.parse()?)
+        } else {
+            Err(InputValueError::expected_type(value))
+        }
+    }
+
+    fn to_value(&self) -> async_graphql::Value {
+        async_graphql::Value::String(self.to_string())
     }
 }
 

@@ -1,0 +1,69 @@
+name: Ubuntu builds
+
+on:
+  workflow_call:
+    inputs:
+      all-platforms:
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      publish-package-login:
+        required: false
+
+jobs:
+  build:
+    name: Ubuntu ${{ matrix.ubuntu-version }} - Build
+    runs-on: ubuntu-latest
+    env:
+      can-publish: ${{ !! secrets.publish-package-login }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu-version: ${{ fromJSON(inputs.all-platforms && '["2204","2404"]' || '["2204"]') }}
+    steps:
+      - name: Timestamp
+        id: ccache_cache_timestamp
+        run: echo timestamp=`date -u +"%Y-%m-%d-%H-%M-%S"` >>$GITHUB_OUTPUT
+      - name: Maximize build space
+        uses: James-Mart/maximize-build-space@master
+        with:
+          root-reserve-mb: 24576
+          temp-reserve-mb: 512
+          remove-android: "true"
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          submodules: false
+          fetch-depth: 0
+      - name: Preserve ccache
+        uses: actions/cache@v3
+        with:
+          path: .caches
+          key: $ubuntu-${{ matrix.ubuntu-version }}-caches-${{ steps.ccache_cache_timestamp.outputs.timestamp }}
+          restore-keys: |
+            $ubuntu-${{ matrix.ubuntu-version }}-caches-
+      - name: Build
+        env:
+          BUILDER_IMAGE_2204: f8d833ccdd03cbaaa2e6319c9c01a93168b82f37
+          BUILDER_IMAGE_2404: 69a0c8fa35ac92723a85000d2775aca292e71e54
+        run: |
+          BUILDER_IMAGE="ghcr.io/${{ github.repository_owner }}/psibase-builder-ubuntu-${{ matrix.ubuntu-version }}:$BUILDER_IMAGE_${{ matrix.ubuntu-version }}"
+          echo $BUILDER_IMAGE
+          bash ${GITHUB_WORKSPACE}/.github/scripts/build.sh ${GITHUB_WORKSPACE} "$BUILDER_IMAGE" ${{ matrix.ubuntu-version }}
+      - name: Publish packages
+        if: fromJSON(env.can-publish) && matrix.ubuntu-version == '2404'
+        env:
+          PUBLISH_LOGIN: ${{ secrets.publish-package-login }}
+        run: bash ${GITHUB_WORKSPACE}/.github/scripts/publish.sh
+      - name: Upload psidk-ubuntu-${{ matrix.ubuntu-version }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: psidk-ubuntu-${{ matrix.ubuntu-version }}
+          path: build/psidk-ubuntu-${{ matrix.ubuntu-version }}.tar.gz
+      - name: Upload psidk-book
+        if: ${{ matrix.ubuntu-version == '2404' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: psidk-book
+          path: psidk-book.tar.gz

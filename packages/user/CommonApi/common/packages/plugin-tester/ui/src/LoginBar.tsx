@@ -1,0 +1,69 @@
+import { useEffect, useState } from "react";
+
+import { FunctionCallArgs, type Supervisor } from "@psibase/common-lib";
+
+function withArgs(
+    service: string,
+    plugin: string,
+    intf: string,
+    method: string,
+    params: unknown[] = [],
+): FunctionCallArgs {
+    return {
+        service,
+        plugin,
+        intf,
+        method,
+        params,
+    };
+}
+
+export function LoginBar({ supervisor }: { supervisor: Supervisor }) {
+    const [currentUser, setCurrentUser] = useState<string | null>(null);
+
+    useEffect(() => {
+        const fetchUser = async () => {
+            try {
+                const user = await supervisor.functionCall(
+                    withArgs("accounts", "plugin", "api", "getCurrentUser"),
+                );
+                setCurrentUser(user || null);
+            } catch (e) {
+                alert("Error fetching current user: " + e);
+            }
+        };
+
+        fetchUser();
+    }, [supervisor]);
+
+    const handleClick = async () => {
+        try {
+            if (currentUser) {
+                await supervisor.functionCall(
+                    withArgs("accounts", "plugin", "activeApp", "logout"),
+                );
+                setCurrentUser(null);
+            } else {
+                await supervisor.functionCall(
+                    withArgs(
+                        "accounts",
+                        "plugin",
+                        "activeApp",
+                        "connectAccount",
+                    ),
+                    { enabled: true, returnPath: "/common/plugin-tester" },
+                );
+            }
+        } catch (e) {
+            console.error("Error logging out or in: ", e);
+        }
+    };
+
+    return (
+        <div className="login-bar">
+            <button onClick={handleClick} className="common-button">
+                {currentUser ? currentUser : "Connect account"}
+            </button>
+        </div>
+    );
+}

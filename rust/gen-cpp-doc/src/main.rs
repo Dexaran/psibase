@@ -1,5 +1,5 @@
 use clang::documentation::{Comment, CommentChild};
-use clang::{Accessibility, Entity, EntityKind, TranslationUnit};
+use clang::{Accessibility, Entity, EntityKind, TranslationUnit, Type};
 use clap::{Parser, Subcommand};
 use mdbook::preprocess::CmdPreprocessor;
 use mdbook::BookItem;
@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::io;
+use std::path::Path;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -33,6 +34,8 @@ enum Kind {
     Enum,
     EnumConstant,
     Struct,
+    Alias,
+    Macro,
 }
 
 struct Item<'tu> {
@@ -82,6 +85,15 @@ fn convert_children<'a, 'tu>(items: &'a mut Vec<Item<'tu>>, current: usize, enti
             }
             EntityKind::StructDecl => {
                 convert_child(items, current, child, Kind::Struct, false);
+            }
+            EntityKind::TypeAliasDecl => {
+                convert_child(items, current, child, Kind::Alias, false);
+            }
+            EntityKind::TypeAliasTemplateDecl => {
+                convert_child(items, current, child, Kind::Alias, false);
+            }
+            EntityKind::MacroDefinition => {
+                convert_child(items, current, child, Kind::Macro, false);
             }
             _ => (),
         }
@@ -400,6 +412,8 @@ fn generate_documentation(items: &[Item], path: &str) -> String {
             Kind::Enum => document_enum(items, index, path, &mut result),
             Kind::Function => document_function(items, index, path, &mut result),
             Kind::Struct => document_struct(items, index, path, &mut result),
+            Kind::Alias => document_alias(items, index, path, &mut result),
+            Kind::Macro => document_macro(items, index, path, &mut result),
             _ => (),
         }
     }
@@ -557,7 +571,7 @@ fn document_struct(items: &[Item], index: usize, path: &str, result: &mut String
     def.push_str("};\n</code></pre>\n");
     let _ = write!(
         result,
-        "### {}\n\n{}\n{}\n",
+        "## {}\n\n{}\n{}\n",
         &path[2..],
         def,
         replace_bracket_links(&item.doc_str, items, index)
@@ -640,6 +654,42 @@ fn document_function(items: &[Item], index: usize, path: &str, result: &mut Stri
     );
 } // document_function
 
+fn unwrap_alias<'tu>(entity: &Entity<'tu>) -> Type<'tu> {
+    match entity.get_kind() {
+        EntityKind::TypeAliasTemplateDecl => {
+            for child in entity.get_children() {
+                if child.get_kind() == EntityKind::TypeAliasDecl {
+                    return unwrap_alias(&child);
+                }
+            }
+            panic!("underlying type not found");
+        }
+        _ => entity.get_typedef_underlying_type().unwrap(),
+    }
+}
+
+fn document_alias(items: &[Item], index: usize, path: &str, result: &mut String) {
+    let item = &items[index];
+    let mut def = String::new();
+    def.push_str(r#"<pre><code class="nohighlight">"#);
+    document_template_args(item, &mut def);
+    def.push_str(r#"<span class="hljs-keyword">using</span> "#);
+    def.push_str(r#"<span class="hljs-title">"#);
+    def.push_str(&path[2..]);
+    def.push_str(r#"</span> = "#);
+    let ty = unwrap_alias(&item.entity).get_display_name();
+    def.push_str(&style_type(&escape_and_add_links(&ty, items, index)));
+    def.push_str(";\n</code></pre>\n");
+
+    let _ = write!(
+        result,
+        "### {}\n\n{}\n{}\n",
+        &path[2..],
+        def,
+        replace_bracket_links(&item.doc_str, items, index)
+    );
+}
+
 fn document_template_args(item: &Item, def: &mut String) {
     let template_args: Vec<Entity> = filter_children(&item.entity, |c| {
         c.get_kind() == EntityKind::TemplateTypeParameter
@@ -661,6 +711,25 @@ fn document_template_args(item: &Item, def: &mut String) {
         }
         def.push_str("&gt;\n");
     }
+}
+
+fn document_macro(items: &[Item], index: usize, path: &str, result: &mut String) {
+    let item = &items[index];
+    let mut def = String::new();
+    def.push_str(r#"<pre><code class="nohighlight">"#);
+    def.push_str(r#"<span class="hljs-keyword">#define</span> "#);
+    def.push_str(r#"<span class="hljs-title">"#);
+    def.push_str(&path[..]);
+    def.push_str(r#"</span>"#);
+    def.push_str("\n</code></pre>\n");
+
+    let _ = write!(
+        result,
+        "### {}\n\n{}\n{}\n",
+        &path[..],
+        def,
+        replace_bracket_links(&item.doc_str, items, index)
+    );
 }
 
 fn escape_html(s: &str) -> String {
@@ -695,18 +764,51 @@ fn dump(entity: &Entity, indent: usize) {
     }
 }
 
+fn get_clang_include_dir(wasi_sdk_prefix: &str) -> String {
+    let mut path = wasi_sdk_prefix.to_owned() + "/lib/clang/13.0.0/include";
+    if let Ok(dirs) = std::fs::read_dir(std::path::Path::new(
+        &(wasi_sdk_prefix.to_owned() + "/lib/clang"),
+    )) {
+        for dir in dirs {
+            if let Ok(d) = dir {
+                let mut buf = d.path();
+                buf.push("include");
+                if buf.is_dir() {
+                    if let Some(s) = buf.to_str() {
+                        path = s.to_owned();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    path
+}
+
+fn get_wasi_include_dir(wasi_sdk_prefix: &str) -> String {
+    let dir = wasi_sdk_prefix.to_owned() + "/share/wasi-sysroot/include";
+    let wasm32_wasi_dir = dir.clone() + "/wasm32-wasip1";
+    if Path::new(&wasm32_wasi_dir).exists() {
+        wasm32_wasi_dir
+    } else {
+        dir
+    }
+}
+
 fn parse<'tu>(
     index: &'tu clang::Index<'tu>,
     repo_path: &str,
     build_path: &str,
 ) -> Result<TranslationUnit<'tu>, anyhow::Error> {
-    let mut parser = index.parser(repo_path.to_owned() + "/doc/psidk/src/doc-root.cpp");
+    let mut parser = index.parser(repo_path.to_owned() + "/doc/src/doc-root.cpp");
     let wasi_sdk_prefix = env::var("WASI_SDK_PREFIX")?;
+    let wasi_include_dir = get_wasi_include_dir(&wasi_sdk_prefix);
+    let clang_include_dir = get_clang_include_dir(&wasi_sdk_prefix);
     parser.arguments(&[
         "-fcolor-diagnostics",
-        "-std=c++2a",
+        "-std=c++23",
         "-c",
-        "--target=wasm32-wasi",
+        "--target=wasm32-wasip1",
         "-fno-exceptions",
         "-nostdlib",
         "-nostdinc",
@@ -714,17 +816,24 @@ fn parse<'tu>(
         "-nostdlib++",
         "-DCOMPILING_SERVICE",
         "-DCOMPILING_WASM",
-        &("-I".to_owned() + &wasi_sdk_prefix + "/share/wasi-sysroot/include/c++/v1"),
-        &("-I".to_owned() + &wasi_sdk_prefix + "/share/wasi-sysroot/include"),
-        &("-I".to_owned() + &wasi_sdk_prefix + "/lib/clang/13.0.0/include"),
+        &("-I".to_owned() + &wasi_include_dir + "/c++/v1"),
+        &("-I".to_owned() + &wasi_include_dir),
+        &("-I".to_owned() + &clang_include_dir),
         &("-I".to_owned() + build_path + "/wasm/boost"),
         &("-I".to_owned() + build_path + "/wasm/deps/include"),
-        &("-I".to_owned() + repo_path + "/services/system/ProxySys/include"),
-        &("-I".to_owned() + repo_path + "/services/system/TransactionSys/include"),
-        &("-I".to_owned() + repo_path + "/services/user/CommonSys/include"),
-        &("-I".to_owned() + repo_path + "/services/user/PsiSpaceSys/include"),
+        &("-I".to_owned() + repo_path + "/packages/system/HttpServer/include"),
+        &("-I".to_owned() + repo_path + "/packages/system/Transact/include"),
+        &("-I".to_owned() + repo_path + "/packages/system/Accounts/include"),
+        &("-I".to_owned() + repo_path + "/packages/system/AuthSig/include"),
+        &("-I".to_owned() + repo_path + "/packages/system/SetCode/include"),
+        &("-I".to_owned() + repo_path + "/packages/system/StagedTx/service/cpp/include/"),
+        &("-I".to_owned() + repo_path + "/packages/user/CommonApi/include"),
+        &("-I".to_owned() + repo_path + "/packages/user/Events/include"),
+        &("-I".to_owned() + repo_path + "/packages/user/Invite/include"),
+        &("-I".to_owned() + repo_path + "/packages/user/Tokens/include"),
+        &("-I".to_owned() + repo_path + "/packages/user/Sites/include"),
+        &("-I".to_owned() + repo_path + "/packages/local/XAdmin/include"),
         &("-I".to_owned() + repo_path + "/external/rapidjson/include"),
-        &("-I".to_owned() + repo_path + "/external/simdjson/include"),
         &("-I".to_owned() + repo_path + "/libraries/psibase/common/include"),
         &("-I".to_owned() + repo_path + "/libraries/psibase/service/include"),
         &("-I".to_owned() + repo_path + "/libraries/psio/consthash/include"),
@@ -732,13 +841,14 @@ fn parse<'tu>(
     ]);
     parser.skip_function_bodies(true);
     parser.keep_going(true);
+    parser.detailed_preprocessing_record(true);
     Ok(parser.parse()?)
 }
 
 fn modify_book(book: &mut mdbook::book::Book, mut items: Vec<Item>) {
-    let cpp_doc_re = Regex::new(r"[{][{] *#cpp-doc +(::[^ ]+)+ *[}][}]").unwrap();
-    // I got lazy here. ` within the diagram will cause svg_bob_re to not match.
-    let svg_bob_re = Regex::new(r"```svgbob([^`]+)```").unwrap();
+    let cpp_doc_re = Regex::new(r"[{][{] *#cpp-doc +([^ ]+) *[}][}]").unwrap();
+    let svg_bob_re = Regex::new(r"(?s)```svgbob(.*?)```").unwrap();
+
     for item in book.iter() {
         match item {
             BookItem::Chapter(chapter) => {
@@ -772,7 +882,20 @@ fn modify_book(book: &mut mdbook::book::Book, mut items: Vec<Item>) {
             chapter.content = svg_bob_re
                 .replace_all(&chapter.content, |caps: &Captures| {
                     let markup = caps.get(1).unwrap().as_str();
-                    format!("<pre class=\"svgbob\">{}</pre>", svgbob::to_svg(markup))
+                    let svg = svgbob::to_svg(markup);
+
+                    // Custom dark theme for SvgBob
+                    let styled_svg =
+                        svg.replace("<rect ", "<rect style=\"fill:transparent; stroke:white;\" ");
+                    let styled_svg = styled_svg.replace("<text ", "<text style=\"fill:white;\" ");
+                    let styled_svg = styled_svg
+                        .replace("<line ", "<line style=\"stroke:white;stroke-width:2;\" ");
+                    let styled_svg = styled_svg
+                        .replace("<polygon ", "<polygon style=\"stroke:white;fill:white;\" ");
+                    let styled_svg =
+                        styled_svg.replace("<path", "<path style=\"stroke:white;stroke-width:2;\"");
+
+                    format!("<pre class=\"svgbob\">{}</pre>", styled_svg)
                 })
                 .to_string();
             // chapter.content = chapter.content.replace(

@@ -1,65 +1,90 @@
 #include <psibase/tester.hpp>
+#include <psibase/testerApi.hpp>
 
-#include <secp256k1.h>
-#include <services/system/TransactionSys.hpp>
-#include <services/system/VerifyEcSys.hpp>
+#include <psibase/Actor.hpp>
+#include <psibase/block.hpp>
+#include <psibase/fileUtil.hpp>
+#include <psibase/package.hpp>
+#include <psibase/serviceEntry.hpp>
+#include <psibase/version.hpp>
+#include <services/local/XHttp.hpp>
+#include <services/local/XPackages.hpp>
+#include <services/system/RTransact.hpp>
+#include <services/system/Transact.hpp>
+#include <services/system/VerifySig.hpp>
+
+#include <chrono>
+
+#include <fcntl.h>
+
+#include <catch2/catch_message.hpp>
+
+namespace psibase::tester::raw
+{
+   std::optional<std::uint32_t> selectedChain;
+   uint32_t                     getSelectedChain()
+   {
+      check(!!selectedChain, "no chain is selected");
+      return *selectedChain;
+   }
+}  // namespace psibase::tester::raw
 
 namespace
 {
-   using cb_alloc_type = void* (*)(void* cb_alloc_data, size_t size);
-
-   extern "C"
+   std::uint32_t numPublicChains = 0;
+   struct ScopedSelectChain
    {
-      // TODO: fix naming
-
-      // clang-format off
-      [[clang::import_name("testerCreateChain")]]        uint32_t testerCreateChain(uint64_t max_objects, uint64_t hot_addr_bits, uint64_t warm_addr_bits, uint64_t cool_addr_bits, uint64_t cold_addr_bits);
-      [[clang::import_name("testerDestroyChain")]]       void     testerDestroyChain(uint32_t chain);
-      [[clang::import_name("testerExecute")]]            int32_t  testerExecute(const char* command, uint32_t command_size);
-      [[clang::import_name("testerFinishBlock")]]        void     testerFinishBlock(uint32_t chain_index);
-      [[clang::import_name("testerGetChainPath")]]       uint32_t testerGetChainPath(uint32_t chain, char* dest, uint32_t dest_size);
-      [[clang::import_name("testerPushTransaction")]]    void     testerPushTransaction(uint32_t chain_index, const char* args_packed, uint32_t args_packed_size, void* cb_alloc_data, cb_alloc_type cb_alloc);
-      [[clang::import_name("testerReadWholeFile")]]      bool     testerReadWholeFile(const char* filename, uint32_t filename_size, void* cb_alloc_data, cb_alloc_type cb_alloc);
-      [[clang::import_name("testerSelectChainForDb")]]   void     testerSelectChainForDb(uint32_t chain_index);
-      [[clang::import_name("testerShutdownChain")]]      void     testerShutdownChain(uint32_t chain);
-      [[clang::import_name("testerStartBlock")]]         void     testerStartBlock(uint32_t chain_index, uint32_t time_seconds);
-      // clang-format on
+      ScopedSelectChain(std::uint32_t id) : saved(psibase::tester::raw::selectedChain)
+      {
+         psibase::tester::raw::selectedChain = id;
+      }
+      ~ScopedSelectChain() { psibase::tester::raw::selectedChain = saved; }
+      std::optional<std::uint32_t> saved;
+   };
+   __wasi_oflags_t get_wasi_oflags(int flags)
+   {
+      __wasi_oflags_t result = 0;
+      if (flags & O_CREAT)
+         result |= __WASI_OFLAGS_CREAT;
+      if (flags & O_EXCL)
+         result |= __WASI_OFLAGS_EXCL;
+      if (flags & O_TRUNC)
+         result |= __WASI_OFLAGS_TRUNC;
+      return result;
+   }
+   __wasi_rights_t get_wasi_rights(int flags)
+   {
+      __wasi_rights_t result = 0;
+      if ((flags & O_RDONLY) == O_RDONLY || (flags & O_RDWR) == O_RDWR)
+         result |= __WASI_RIGHTS_FD_READ;
+      if ((flags & O_WRONLY) == O_WRONLY || (flags & O_RDWR) == O_RDWR)
+         result |= __WASI_RIGHTS_FD_WRITE;
+      return result;
    }
 
-   template <typename Alloc_fn>
-   inline bool readWholeFile(const char* filename_begin, uint32_t filename_size, Alloc_fn alloc_fn)
-   {
-      // TODO: fix memory issue when file not found
-      return testerReadWholeFile(filename_begin, filename_size, &alloc_fn,
-                                 [](void* cb_alloc_data, size_t size) -> void*
-                                 {  //
-                                    return (*reinterpret_cast<Alloc_fn*>(cb_alloc_data))(size);
-                                 });
-   }
-
-   template <typename Alloc_fn>
-   inline void pushTransaction(uint32_t    chain,
-                               const char* args_begin,
-                               uint32_t    args_size,
-                               Alloc_fn    alloc_fn)
-   {
-      testerPushTransaction(chain, args_begin, args_size, &alloc_fn,
-                            [](void* cb_alloc_data, size_t size) -> void*
-                            {  //
-                               return (*reinterpret_cast<Alloc_fn*>(cb_alloc_data))(size);
-                            });
-   }
-
-   template <typename Alloc_fn>
-   inline bool exec_deferred(uint32_t chain, Alloc_fn alloc_fn)
-   {
-      return tester_exec_deferred(chain, &alloc_fn,
-                                  [](void* cb_alloc_data, size_t size) -> void*
-                                  {  //
-                                     return (*reinterpret_cast<Alloc_fn*>(cb_alloc_data))(size);
-                                  });
-   }
 }  // namespace
+
+using psibase::tester::raw::selectedChain;
+using namespace SystemService::AuthSig;
+
+psibase::TransactionTrace psibase::tester::pushTransaction(std::uint32_t            chain,
+                                                           const SignedTransaction& signedTrx)
+{
+   std::vector<char> packed_trx = psio::convert_to_frac(signedTrx);
+   auto size = tester::raw::pushTransaction(chain, packed_trx.data(), packed_trx.size());
+   return psio::from_frac<TransactionTrace>(getResult(size));
+}
+
+psibase::TransactionTrace psibase::tester::runAction(std::uint32_t chain,
+                                                     RunMode       mode,
+                                                     bool          head,
+                                                     const Action& act)
+{
+   auto packedAction = psio::to_frac(act);
+   auto traceSize =
+       tester::raw::runAction(chain, mode, head, packedAction.data(), packedAction.size());
+   return psio::from_frac<TransactionTrace>(psibase::getResult(traceSize));
+}
 
 psibase::TraceResult::TraceResult(TransactionTrace&& t) : _t(t) {}
 
@@ -101,24 +126,6 @@ bool psibase::TraceResult::failed(std::string_view expected)
    return false;
 }
 
-std::vector<char> psibase::readWholeFile(std::string_view filename)
-{
-   std::vector<char> result;
-   if (!::readWholeFile(filename.data(), filename.size(),
-                        [&](size_t size)
-                        {
-                           result.resize(size);
-                           return result.data();
-                        }))
-      check(false, "read " + std::string(filename) + " failed");
-   return result;
-}
-
-int32_t psibase::execute(std::string_view command)
-{
-   return ::testerExecute(command.data(), command.size());
-}
-
 void psibase::expect(TransactionTrace t, const std::string& expected, bool always_show)
 {
    std::string error = t.error ? *t.error : "";
@@ -134,178 +141,617 @@ void psibase::expect(TransactionTrace t, const std::string& expected, bool alway
    }
 }
 
-psibase::Signature psibase::sign(const PrivateKey& key, const Checksum256& digest)
+namespace
 {
-   static auto context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN);
-   auto*       k1      = std::get_if<0>(&key.data);
-   check(k1, "only k1 currently supported");
+   void loadLocalServices(psibase::TestChain& self)
+   {
+      using namespace psibase;
+      using LocalService::XPackages;
+      auto prefix = psio::convert_to_key(codePrefix());
+      if (self.kvGreaterEqualRaw(DbId::nativeSubjective, prefix, prefix.size()))
+         return;
+      auto serviceRoot = std::getenv("PSIBASE_DATADIR");
+      check(serviceRoot != nullptr, "Cannot find local service directory");
+      auto                     packagesDir = std::string{serviceRoot} + "/packages";
+      DirectoryRegistry        registry{packagesDir};
+      std::vector<std::string> packageNames{"XDefault"};
+      auto                     packages = registry.resolve(packageNames);
+      std::vector<HttpRequest> requests;
+      tester::raw::checkoutSubjective(self.nativeHandle());
+      for (const auto& info : packages)
+      {
+         auto package = registry.get(info);
+         for (const auto& [account, header, serviceInfo] : package.services)
+         {
+            auto file = package.archive.getEntry(header);
 
-   secp256k1_ecdsa_signature sig;
-   check(secp256k1_ecdsa_sign(context, &sig, reinterpret_cast<const unsigned char*>(digest.data()),
-                              k1->data(), nullptr, nullptr) == 1,
-         "sign failed");
+            std::vector<std::uint8_t> code(file.uncompressedSize());
+            file.read({reinterpret_cast<char*>(code.data()), code.size()});
 
-   EccSignature sigdata;
-   check(secp256k1_ecdsa_signature_serialize_compact(context, sigdata.data(), &sig) == 1,
-         "serialize signature failed");
-   return Signature{Signature::variant_type{std::in_place_index<0>, sigdata}};
-}
+            auto    codeHash = sha256(code.data(), code.size());
+            CodeRow codeRow{
+                .codeNum  = account,
+                .flags    = serviceInfo.parseFlags(),
+                .codeHash = codeHash,
+            };
+            self.kvPut(DbId::nativeSubjective, codeRow.key(), codeRow);
+            CodeByHashRow codeByHashRow{
+                .codeHash = codeHash,
+                .code     = std::move(code),
+            };
+            self.kvPut(DbId::nativeSubjective, codeByHashRow.key(), codeByHashRow);
+         }
 
-void psibase::internal_use_do_not_use::hex(const uint8_t* begin,
-                                           const uint8_t* end,
-                                           std::ostream&  os)
+         std::string rootHost("", 1);
+
+         for (const auto& [account, header] : package.data)
+         {
+            auto file             = package.archive.getEntry(header);
+            auto [path, mimeType] = package.dataFileInfo(header.filename);
+
+            requests.push_back(HttpRequest{
+                .host        = account.str() + "." + rootHost,
+                .method      = "PUT",
+                .target      = std::string(path),
+                .contentType = std::string(mimeType),
+                .body        = file.read(),
+            });
+         }
+
+         requests.push_back(HttpRequest{
+             .host        = XPackages::service.str() + "." + rootHost,
+             .method      = "PUT",
+             .target      = "/manifest/" + psio::hex(info.sha256.begin(), info.sha256.end()),
+             .contentType = "application/json",
+             .body        = package.manifest(),
+         });
+         HttpRequest postinstall{
+             .host        = XPackages::service.str() + "." + rootHost,
+             .method      = "POST",
+             .target      = "/postinstall",
+             .contentType = "application/json",
+         };
+         psio::vector_stream stream(postinstall.body);
+         to_json(info, stream);
+         requests.push_back(std::move(postinstall));
+      }
+      psibase::check(tester::raw::commitSubjective(self.nativeHandle()),
+                     "Failed to commit changes");
+
+      for (const auto& request : requests)
+      {
+         auto reply = self.http(request);
+         if (reply.status != HttpStatus::ok)
+         {
+            auto message = std::format("PUT {} returned {}", request.target,
+                                       static_cast<std::uint16_t>(reply.status));
+            if (reply.contentType.starts_with("text/"))
+            {
+               message += ": ";
+               message.append(reply.body.data(), reply.body.size());
+            }
+            abortMessage(message);
+         }
+      }
+   }
+
+   void startSession(psibase::TestChain& self)
+   {
+      using namespace psibase;
+      HostConfigRow row{std::format("psitest-{}.{}.{}", PSIBASE_VERSION_MAJOR,
+                                    PSIBASE_VERSION_MINOR, PSIBASE_VERSION_PATCH),
+                        R"({"host":{"hosts":["psibase.io"]}})"};
+
+      tester::raw::checkoutSubjective(self.nativeHandle());
+      self.kvPut(row.db, row.key(), row);
+      psibase::check(tester::raw::commitSubjective(self.nativeHandle()),
+                     "Failed to commit changes");
+      transactor<LocalService::XHttp> xhttp{AccountNumber{}, LocalService::XHttp::service};
+      expect(tester::runAction(self.nativeHandle(), RunMode::rpc, true, xhttp.startSession()));
+   }
+
+}  // namespace
+
+psibase::TestChain::TestChain(uint32_t chain_id, bool clone, bool pub, bool init, bool writable)
+    : id{clone ? tester::raw::cloneChain(chain_id) : chain_id}, isPublicChain(pub)
 {
-   std::ostreambuf_iterator<char> dest(os.rdbuf());
-   auto                           nibble = [&dest](uint8_t i)
+   if (pub && numPublicChains++ == 0)
+      psibase::tester::raw::selectedChain = id;
+   if (init)
    {
-      if (i <= 9)
-         *dest++ = '0' + i;
-      else
-         *dest++ = 'A' + i - 10;
-   };
-   while (begin != end)
+      loadLocalServices(*this);
+   }
+   if (writable)
    {
-      nibble(((uint8_t)*begin) >> 4);
-      nibble(((uint8_t)*begin) & 0xf);
-      ++begin;
+      startSession(*this);
    }
 }
 
-// TODO: change defaults
-const psibase::PublicKey psibase::TestChain::defaultPubKey =
-    psibase::publicKeyFromString("PUB_K1_8UUMcamEE6dnK4kyrSPnAEAPTWZduZtE9SuFvURr3UjGDpF9LX");
-const psibase::PrivateKey psibase::TestChain::defaultPrivKey =
-    psibase::privateKeyFromString("PVT_K1_27Hseiioosmff4ue31Jv37pC1NWfhbjuKuSBxEkqCTzbJtxQD2");
-
-// We only allow one chain to exist at a time in the tester.
-// If we ever find that we need multiple chains, this will
-// need to be kept in sync with whatever updates the native layer.
-static psibase::TestChain* currentChain = nullptr;
-
-psibase::TestChain::TestChain(uint64_t max_objects,
-                              uint64_t hot_addr_bits,
-                              uint64_t warm_addr_bits,
-                              uint64_t cool_addr_bits,
-                              uint64_t cold_addr_bits)
-    : id{::testerCreateChain(max_objects,
-                             hot_addr_bits,
-                             warm_addr_bits,
-                             cool_addr_bits,
-                             cold_addr_bits)}
+psibase::TestChain::TestChain(const TestChain& other, bool pub)
+    : TestChain{other.id, true, pub, false}
 {
-   currentChain = this;
+   status = other.status;
+}
+
+psibase::TestChain::TestChain(const DatabaseConfig& dbconfig, bool pub)
+    : TestChain{tester::raw::createChain(dbconfig.hotBytes,
+                                         dbconfig.warmBytes,
+                                         dbconfig.coolBytes,
+                                         dbconfig.coldBytes),
+                false, pub}
+{
+}
+
+psibase::TestChain::TestChain(uint64_t hot_bytes,
+                              uint64_t warm_bytes,
+                              uint64_t cool_bytes,
+                              uint64_t cold_bytes)
+    : TestChain(DatabaseConfig{hot_bytes, warm_bytes, cool_bytes, cold_bytes})
+{
+}
+
+psibase::TestChain::TestChain(std::string_view path, int flags, const DatabaseConfig& cfg, bool pub)
+    : TestChain(tester::raw::openChain(path.data(),
+                                       path.size(),
+                                       get_wasi_oflags(flags),
+                                       get_wasi_rights(flags),
+                                       &cfg),
+                false,
+                pub,
+                (flags & (O_CREAT | O_TRUNC)) != 0,
+                (get_wasi_rights(flags) & __WASI_RIGHTS_FD_WRITE) != 0)
+{
 }
 
 psibase::TestChain::~TestChain()
 {
-   currentChain = nullptr;
-   ::testerDestroyChain(id);
+   if (isPublicChain)
+      --numPublicChains;
+   tester::raw::destroyChain(id);
+   if (selectedChain && *selectedChain == id)
+      selectedChain.reset();
 }
 
 void psibase::TestChain::shutdown()
 {
-   ::testerShutdownChain(id);
+   tester::raw::shutdownChain(id);
 }
 
-std::string psibase::TestChain::getPath()
+void psibase::TestChain::setAutoBlockStart(bool enable)
 {
-   size_t      len = testerGetChainPath(id, nullptr, 0);
-   std::string result(len, 0);
-   testerGetChainPath(id, result.data(), len);
-   return result;
+   isAutoBlockStart = enable;
+}
+
+void psibase::TestChain::setAutoRun(bool enable)
+{
+   isAutoRun = enable;
 }
 
 void psibase::TestChain::startBlock(int64_t skip_miliseconds)
 {
-   auto time = status ? status->current.time : TimePointSec{};
-   startBlock(TimePointSec{time.seconds + 1 + uint32_t(skip_miliseconds / 1000)});
+   if (producing)
+      finishBlock();
+   auto time = status ? status->head->header.time : TimePointSec{};
+   startBlock(time + MicroSeconds{(1000 + skip_miliseconds) * 1000});
 }
 
 void psibase::TestChain::startBlock(std::string_view time)
 {
-   uint64_t value;
-   auto     data = time.data();
-   check(stringToUtcMicroseconds(value, data, data + time.size(), true), "bad time");
-   startBlock(TimePointSec{.seconds = uint32_t(value / 1000)});
+   std::int64_t  sec;
+   std::uint32_t nsec;
+   if (!psio::parse_system_time(time, sec, nsec))
+      abortMessage("bad time");
+   startBlock(TimePointUSec{Seconds{sec} + MicroSeconds{nsec / 1000}});
 }
 
-void psibase::TestChain::startBlock(TimePointSec tp)
+void psibase::TestChain::startBlock(BlockTime tp)
 {
+   if (producing)
+      finishBlock();
+
+   auto producer = AccountNumber{"firstproducer"};
+   if (status)
+   {
+      auto getFirstProducer = [&](const auto& c)
+      {
+         if (!c.producers.empty())
+         {
+            producer = c.producers.front().name;
+         }
+      };
+      if (status->consensus.next)
+         std::visit(getFirstProducer, status->consensus.next->consensus.data);
+      if (!status->consensus.next || status->current.commitNum < status->consensus.next->blockNum)
+         std::visit(getFirstProducer, status->consensus.current.data);
+   }
+
+   auto term      = status ? status->current.term : 0;
+   auto commitNum = status ? status->head.value().header.blockNum : 0;
+
    // Guarantee that there is a recent block for fillTapos to use.
-   if (status && status->current.time.seconds + 1 < tp.seconds)
-      ::testerStartBlock(id, tp.seconds - 1);
-   ::testerStartBlock(id, tp.seconds);
-   status    = psibase::kvGet<psibase::StatusRow>(psibase::StatusRow::db, psibase::statusKey());
+   if (status && status->head->header.time + Seconds(1) < tp)
+   {
+      tester::raw::startBlock(id, (tp - Seconds(1)).time_since_epoch().count(), producer.value,
+                              term, commitNum);
+      finishBlock();
+      commitNum = status->head.value().header.blockNum;
+   }
+   tester::raw::startBlock(id, tp.time_since_epoch().count(), producer.value, term, commitNum);
+   status    = kvGet<psibase::StatusRow>(psibase::StatusRow::db, psibase::statusKey());
    producing = true;
 }
 
 void psibase::TestChain::finishBlock()
 {
-   ::testerFinishBlock(id);
+   tester::raw::finishBlock(id);
+   status    = kvGet<StatusRow>(StatusRow::db, statusKey());
    producing = false;
+   if (isAutoRun)
+      runAll();
 }
 
-void psibase::TestChain::fillTapos(Transaction& t, uint32_t expire_sec)
+void psibase::TestChain::setSignature(BlockNum blockNum, std::vector<char> sig)
 {
-   t.tapos.expiration.seconds = (status ? status->current.time.seconds : 0) + expire_sec;
-   auto [index, suffix]       = SystemService::headTapos();
-   t.tapos.refBlockIndex      = index;
-   t.tapos.refBlockSuffix     = suffix;
+   kvPut(DbId::blockProof, blockNum, std::move(sig));
+   tester::raw::commitState(id);
 }
 
-psibase::Transaction psibase::TestChain::makeTransaction(std::vector<Action>&& actions)
+void psibase::TestChain::fillTapos(Transaction& t, uint32_t expire_sec) const
+{
+   ScopedSelectChain s{id};
+   t.tapos.expiration =
+       (status ? std::chrono::time_point_cast<Seconds>(status->current.time) : TimePointSec{}) +
+       Seconds(expire_sec);
+   auto [index, suffix]   = SystemService::headTapos();
+   t.tapos.refBlockIndex  = index;
+   t.tapos.refBlockSuffix = suffix;
+}
+
+psibase::Transaction psibase::TestChain::makeTransaction(std::vector<Action>&& actions,
+                                                         uint32_t              expire_sec) const
 {
    Transaction t;
-   fillTapos(t);
+   fillTapos(t, expire_sec);
    t.actions = std::move(actions);
    return t;
 }
+
+psibase::SignedTransaction psibase::TestChain::signTransaction(Transaction trx, const KeyList& keys)
+{
+   for (auto& [pub, priv] : keys)
+      trx.claims.push_back({
+          .service = SystemService::VerifySig::service,
+          .rawData = {pub.data.begin(), pub.data.end()},
+      });
+   SignedTransaction signedTrx;
+   signedTrx.transaction = trx;
+   auto hash             = sha256(signedTrx.transaction.data(), signedTrx.transaction.size());
+   for (auto& [pub, priv] : keys)
+   {
+      auto proof = sign(priv, hash);
+      signedTrx.proofs.push_back({proof.begin(), proof.end()});
+   }
+   return signedTrx;
+}
+
+namespace
+{
+   struct RunTokenData
+   {
+      bool                 success;
+      psibase::RunMode     mode;
+      psibase::Action      action;
+      psibase::Checksum256 context;
+      PSIO_REFLECT(RunTokenData, success, mode, action, context)
+   };
+
+   psibase::Checksum256 makeRunContext(psibase::TestChain&                      chain,
+                                       psibase::RunMode                         mode,
+                                       const std::optional<psibase::StatusRow>& status)
+   {
+      using namespace psibase;
+      if (mode == RunMode::verify)
+      {
+         std::vector<BlockHeaderAuthAccount> result;
+         if (status)
+         {
+            auto& consensus = status->consensus.next ? status->consensus.next->consensus
+                                                     : status->consensus.current;
+            for (auto service : consensus.services)
+            {
+               if (chain
+                       .kvGet<CodeByHashRow>(
+                           CodeByHashRow::db,
+                           codeByHashKey(service.codeHash, service.vmType, service.vmVersion))
+                       .has_value())
+               {
+                  result.push_back(service);
+               }
+            }
+         }
+         return sha256(result);
+      }
+      else
+      {
+         return Checksum256{};
+      }
+   }
+
+   std::vector<std::optional<RunTokenData>> getRunTokens(psibase::TestChain&               chain,
+                                                         const psibase::SignedTransaction& trx)
+   {
+      using namespace psibase;
+      std::vector<std::optional<RunTokenData>> tokens;
+      if (trx.proofs.empty())
+         return tokens;
+      if (auto row = chain.kvGet<NotifyRow>(DbId::nativeSubjective,
+                                            notifyKey(NotifyType::preverifyTransaction)))
+      {
+         for (auto& act : row->actions)
+         {
+            check(act.sender == AccountNumber{} && act.rawData.empty(),
+                  "Invalid preverifyTransaction callback");
+            act.rawData = psio::to_frac(std::tuple(trx));
+            auto trace  = tester::runAction(chain.nativeHandle(), RunMode::callback, false, act);
+            if (trace.error)
+               abortMessage("preverify failed: " + *trace.error);
+            check(trace.actionTraces.size() == 1, "Wrong number of action traces");
+            if (auto result = psio::from_frac<std::optional<std::vector<std::optional<RunToken>>>>(
+                    trace.actionTraces.front().rawRetval))
+            {
+               for (const auto& token : *result)
+               {
+                  if (token)
+                  {
+                     tokens.push_back(psio::from_frac<RunTokenData>(*token));
+                  }
+                  else
+                  {
+                     tokens.emplace_back();
+                  }
+               }
+               break;
+            }
+         }
+      }
+      tokens.resize(trx.proofs.size());
+      return tokens;
+   }
+
+   void callRejectTransaction(psibase::TestChain&              chain,
+                              const psibase::Checksum256&      id,
+                              const psibase::TransactionTrace& trace)
+   {
+      using namespace psibase;
+      if (auto row = chain.kvGet<NotifyRow>(DbId::native, notifyKey(NotifyType::rejectTransaction)))
+      {
+         for (auto& act : row->actions)
+         {
+            check(act.sender == AccountNumber{} && act.rawData.empty(),
+                  "Invalid rejectTransaction callback");
+            act.rawData = psio::to_frac(std::tie(id, trace));
+            auto trace  = tester::runAction(chain.nativeHandle(), RunMode::callback, false, act);
+            if (trace.error)
+               abortMessage("onTransaction failed: " + *trace.error);
+         }
+      }
+   }
+
+   psibase::TransactionTrace verifySignatures(psibase::TestChain&                      chain,
+                                              const std::optional<psibase::StatusRow>& status,
+                                              const psibase::SignedTransaction&        trx)
+   {
+      using namespace psibase;
+      auto trxId  = sha256(trx.transaction.data(), trx.transaction.size());
+      auto claims = trx.transaction->claims();
+      if (trx.proofs.size() != claims.size())
+      {
+         return TransactionTrace{.error = "proofs and claims must have same size"};
+      }
+      auto tokens        = getRunTokens(chain, trx);
+      auto verifyContext = makeRunContext(chain, RunMode::verify, status);
+      for (auto&& [claim, proof, token] : std::views::zip(claims, trx.proofs, tokens))
+      {
+         VerifyArgs args{trxId, claim, proof};
+         Action     act{.sender  = AccountNumber{},
+                        .service = claim.service(),
+                        .method  = MethodNumber("verifySys"),
+                        .rawData = psio::to_frac(args)};
+         if (token && token->success && token->mode == RunMode::verify && token->action == act &&
+             token->context == verifyContext)
+         {
+            // skip execution
+         }
+         else
+         {
+            auto trace = tester::runAction(chain.nativeHandle(), RunMode::verify, true, act);
+            if (trace.error)
+            {
+               // We're not running pushTransaction, so we need
+               // to run the failure callback ourselves.
+               callRejectTransaction(chain, trxId, trace);
+               return trace;
+            }
+         }
+      }
+      return {};
+   }
+}  // namespace
 
 [[nodiscard]] psibase::TransactionTrace psibase::TestChain::pushTransaction(
     const SignedTransaction& signedTrx)
 {
    if (!producing)
       startBlock();
-   std::vector<char> packed_trx = psio::convert_to_frac(signedTrx);
-   std::vector<char> bin;
-   ::pushTransaction(id, packed_trx.data(), packed_trx.size(),
-                     [&](size_t size)
-                     {
-                        bin.resize(size);
-                        return bin.data();
-                     });
-   return psio::convert_from_frac<TransactionTrace>(bin);
+   if (auto trace = verifySignatures(*this, status, signedTrx); trace.error)
+   {
+      return trace;
+   }
+   return tester::pushTransaction(id, signedTrx);
 }
 
-[[nodiscard]] psibase::TransactionTrace psibase::TestChain::pushTransaction(
-    Transaction                                          trx,
-    const std::vector<std::pair<PublicKey, PrivateKey>>& keys)
+[[nodiscard]] psibase::TransactionTrace psibase::TestChain::pushTransaction(Transaction    trx,
+                                                                            const KeyList& keys)
 {
-   for (auto& [pub, priv] : keys)
-      trx.claims.push_back({
-          .service = SystemService::VerifyEcSys::service,
-          .rawData = psio::convert_to_frac(pub),
-      });
-   SignedTransaction signedTrx;
-   signedTrx.transaction = trx;
-   auto hash             = sha256(signedTrx.transaction.data(), signedTrx.transaction.size());
-   for (auto& [pub, priv] : keys)
-      signedTrx.proofs.push_back(psio::convert_to_frac(sign(priv, hash)));
-   return pushTransaction(signedTrx);
+   return pushTransaction(signTransaction(std::move(trx), keys));
 }
 
-psibase::TransactionTrace psibase::TestChain::transact(
-    std::vector<Action>&&                                actions,
-    const std::vector<std::pair<PublicKey, PrivateKey>>& keys,
-    const char*                                          expectedExcept)
+void psibase::TestChain::pushBlock(const SignedBlock& block)
 {
-   auto trace = pushTransaction(makeTransaction(std::move(actions)), keys);
-   expect(trace, expectedExcept);
-   return trace;
+   auto& header = block.block.header;
+   tester::raw::getFork(id, block.block.header.previous);
+   tester::raw::startBlock(id, header.time.time_since_epoch().count(), header.producer.value,
+                           header.term, header.commitNum);
+   status    = kvGet<psibase::StatusRow>(psibase::StatusRow::db, psibase::statusKey());
+   producing = true;
+   for (auto& trx : block.block.transactions)
+   {
+      expect(pushTransaction(trx));
+   }
+   finishBlock();
+   BlockInfo info{header};
+   if (info.blockId != status->head->blockId)
+   {
+      abortMessage(std::format("block header does not match: {} != {}",
+                               psio::convert_to_json(info.header),
+                               psio::convert_to_json(status->head->header)));
+   }
 }
 
-psibase::TransactionTrace psibase::TestChain::transact(std::vector<Action>&& actions,
-                                                       const char*           expectedExcept)
+std::optional<psibase::TransactionTrace> psibase::TestChain::pushNextTransaction()
 {
-   return transact(std::move(actions), {{defaultPubKey, defaultPrivKey}}, expectedExcept);
+   if (auto row = kvGet<NotifyRow>(DbId::nativeSubjective, notifyKey(NotifyType::nextTransaction)))
+   {
+      for (auto& act : row->actions)
+      {
+         check(act.sender == AccountNumber{} && act.rawData.empty(),
+               "Invalid nextTransaction callback");
+         act.rawData = psio::to_frac(std::tuple());
+         auto trace  = tester::runAction(id, RunMode::callback, false, act);
+         if (trace.error)
+            abortMessage("nextTransaction failed:\n" + prettyTrace(trace));
+         check(trace.actionTraces.size() == 1, "Wrong number of action traces");
+         if (auto tx = psio::from_frac<std::optional<SignedTransaction>>(
+                 trace.actionTraces.front().rawRetval))
+         {
+            return pushTransaction(*tx);
+         }
+      }
+   }
+   return {};
+}
+
+bool psibase::TestChain::runQueueItem()
+{
+   if (auto row = kvGreaterEqual<RunRow>(RunRow::db, runPrefix(),
+                                         psio::convert_to_key(runPrefix()).size()))
+   {
+      auto trace = tester::runAction(id, row->mode, true, row->action);
+      auto token = psio::to_frac(RunTokenData{!trace.error, row->mode, row->action,
+                                              makeRunContext(*this, row->mode, status)});
+      auto continuationArgs =
+          psio::to_frac(std::tuple(row->id, std::move(trace), std::move(token)));
+      auto continuation      = Action{.service = row->continuation.service,
+                                      .method  = row->continuation.method,
+                                      .rawData = std::move(continuationArgs)};
+      auto continuationTrace = tester::runAction(id, RunMode::rpc, true, continuation);
+      if (continuationTrace.error)
+         abortMessage("Continuation failed: " + *continuationTrace.error);
+      return true;
+   }
+   else
+   {
+      return false;
+   }
+}
+
+void psibase::TestChain::runAll()
+{
+   while (pushNextTransaction() || runQueueItem())
+   {
+   }
+}
+
+psibase::AsyncHttpReply psibase::TestChain::asyncHttp(const HttpRequest& request)
+{
+   if (producing && isAutoBlockStart)
+      finishBlock();
+
+   std::vector<char> packed_request = psio::convert_to_frac(request);
+   auto fd = tester::raw::httpRequest(id, packed_request.data(), packed_request.size());
+   if (isAutoRun)
+      runAll();
+
+   return AsyncHttpReply{fd};
+}
+
+std::optional<psibase::HttpReply> psibase::AsyncHttpReply::poll()
+{
+   std::size_t size;
+   if (auto err = tester::raw::socketRecv(fd, &size))
+   {
+      if (err == EAGAIN)
+      {
+         return {};
+      }
+      else
+      {
+         abortMessage("Could not read response: " + std::to_string(err));
+      }
+   }
+
+   fd = -1;
+   return psio::from_frac<HttpReply>(getResult(size));
+}
+
+psibase::HttpReply psibase::TestChain::http(const HttpRequest& request)
+{
+   return asyncHttp(request).get();
+}
+
+namespace
+{
+   struct LoginInterface
+   {
+      void loginSys(std::string rootHost) {}
+   };
+   PSIO_REFLECT(LoginInterface, method(loginSys, rootHost))
+}  // namespace
+
+std::string psibase::TestChain::login(AccountNumber user, AccountNumber service)
+{
+   transactor<LoginInterface> loginTransactor{user, service};
+   Tapos             tapos{.expiration = std::chrono::time_point_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now()) +
+                             std::chrono::seconds(10),
+                           .flags = Tapos::do_not_broadcast_flag};
+   Transaction       trx{.tapos = tapos, .actions = {loginTransactor.loginSys("psibase.io")}};
+   SignedTransaction strx{trx};
+   auto reply = post<SystemService::LoginReply>(SystemService::Transact::service, "/login",
+                                                FracPackBody{std::move(strx)});
+   return reply.access_token;
+}
+
+std::optional<std::vector<char>> psibase::TestChain::kvGetRaw(psibase::DbId      db,
+                                                              psio::input_stream key)
+{
+   auto size = tester::raw::kvGet(id, db, key.pos, key.remaining());
+   if (size == -1)
+      return std::nullopt;
+   return psibase::getResult(size);
+}
+
+std::optional<std::vector<char>> psibase::TestChain::kvGreaterEqualRaw(DbId               db,
+                                                                       psio::input_stream key,
+                                                                       uint32_t matchKeySize)
+{
+   auto size = tester::raw::kvGreaterEqual(id, db, key.pos, key.remaining(), matchKeySize);
+   if (size == -1)
+      return std::nullopt;
+   return psibase::getResult(size);
+}
+
+void psibase::TestChain::kvPutRaw(DbId db, psio::input_stream key, psio::input_stream value)
+{
+   tester::raw::kvPut(id, db, key.pos, key.remaining(), value.pos, value.remaining());
 }

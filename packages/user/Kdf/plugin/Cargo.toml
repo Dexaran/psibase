@@ -1,0 +1,21 @@
+[package]
+name = "kdf"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+wit-bindgen-rt.workspace = true
+pbkdf2 = "0.12.2"
+sha2 = "0.10.8"
+psibase-plugin-workspace-hack.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "kdf:plugin"
+
+[package.metadata.component.target]
+world = "impl"

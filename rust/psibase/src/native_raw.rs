@@ -4,6 +4,25 @@
 //! available for services to use directly, but we recommend using
 //! the [Wrapped Native Functions](crate::native) instead.
 
+use crate::DbId;
+
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct KvHandle(pub(crate) u32);
+
+impl KvHandle {
+    pub const INVALID: KvHandle = KvHandle(u32::MAX);
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u8)]
+pub enum KvMode {
+    None = 0,
+    Read = 1,
+    Write = 2,
+    ReadWrite = 3,
+}
+
 extern "C" {
     /// Copy `min(dest_size, resultSize - offset)` bytes from
     /// `result + offset` into `dest` and return `resultSize`
@@ -50,15 +69,52 @@ extern "C" {
     /// `action` must contain a fracpacked [crate::Action].
     ///
     /// Use [getResult] to get result.
-    pub fn call(action: *const u8, len: u32) -> u32;
+    pub fn call(action: *const u8, len: u32, flags: u64) -> u32;
 
     /// Set the currently-executing action's return value
     pub fn setRetval(retval: *const u8, len: u32);
 
+    /// Opens a key-value database
+    ///
+    /// The prefix will be added automatically to all accesses using the handle.
+    ///
+    /// Access control is checked at open:
+    /// - Native databases can only be opened by privileged services
+    /// - For regular databases, the first 8 bytes of the prefix must be the
+    ///   caller service (big endian)
+    /// - Some databases forbid reading or writing depending on the run mode
+    ///
+    /// The maximum number of handles that a service can have open
+    /// simultaneously is `WasmConfigRow::maxHandles`. If the limit
+    /// is exceeded, this function will abort.
+    ///
+    /// The handle is only usable by the current service. Use `exportHandles`
+    /// to pass it to another service.
+    pub fn kvOpen(db: DbId, prefix: *const u8, len: u32, mode: KvMode) -> KvHandle;
+
+    /// Opens a subtree of a key-value database
+    ///
+    /// - The prefix will be appended to any prefix that the source has
+    /// - The mode must be at least as restrictive as the source mode
+    ///
+    /// The maximum number of handles that a service can have open
+    /// simultaneously is `WasmConfigRow::maxHandles`. If the limit
+    /// is exceeded, this function will abort.
+    pub fn kvOpenAt(db: KvHandle, prefix: *const u8, len: u32, mode: KvMode) -> KvHandle;
+
+    /// Closes a key-value database
+    ///
+    /// If the handle was exported, all copies are unaffected and
+    /// will remain usable until they are also closed.
+    pub fn kvClose(handle: KvHandle);
+
+    pub fn exportHandles(data: *const u8, len: u32);
+    pub fn importHandles() -> u32;
+
     /// Set a key-value pair
     ///
     /// If key already exists, then replace the existing value.
-    pub fn kvPut(db: crate::DbId, key: *const u8, key_len: u32, value: *const u8, value_len: u32);
+    pub fn kvPut(db: KvHandle, key: *const u8, key_len: u32, value: *const u8, value_len: u32);
 
     /// Add a sequentially-numbered record
     ///
@@ -66,13 +122,13 @@ extern "C" {
     pub fn putSequential(db: crate::DbId, value: *const u8, value_len: u32) -> u64;
 
     /// Remove a key-value pair if it exists
-    pub fn kvRemove(db: crate::DbId, key: *const u8, key_len: u32);
+    pub fn kvRemove(db: KvHandle, key: *const u8, key_len: u32);
 
     /// Get a key-value pair, if any
     ///
     /// If key exists, then sets result to value and returns size. If key does not
     /// exist, returns `u32::MAX` and clears result. Use [getResult] to get result.
-    pub fn kvGet(db: crate::DbId, key: *const u8, key_len: u32) -> u32;
+    pub fn kvGet(db: KvHandle, key: *const u8, key_len: u32) -> u32;
 
     /// Get a sequentially-numbered record
     ///
@@ -87,12 +143,7 @@ extern "C" {
     /// matches the provided key, then sets result to value and returns size. Also
     /// sets key. Otherwise returns `u32::MAX` and clears result. Use [getResult] to get
     /// result and [getKey] to get found key.
-    pub fn kvGreaterEqual(
-        db: crate::DbId,
-        key: *const u8,
-        key_len: u32,
-        match_key_size: u32,
-    ) -> u32;
+    pub fn kvGreaterEqual(db: KvHandle, key: *const u8, key_len: u32, match_key_size: u32) -> u32;
 
     /// Get the key-value pair immediately-before provided key
     ///
@@ -100,12 +151,76 @@ extern "C" {
     /// matches the provided key, then sets result to value and returns size.
     /// Also sets key. Otherwise returns `u32::MAX` and clears result. Use [getResult]
     /// to get result and [getKey] to get found key.
-    pub fn kvLessThan(db: crate::DbId, key: *const u8, key_len: u32, match_key_size: u32) -> u32;
+    pub fn kvLessThan(db: KvHandle, key: *const u8, key_len: u32, match_key_size: u32) -> u32;
 
     /// Get the maximum key-value pair which has key as a prefix
     ///
     /// If one is found, then sets result to value and returns size. Also sets key.
     /// Otherwise returns `u32::MAX` and clears result. Use [getResult] to get result
     /// and [getKey] to get found key.
-    pub fn kvMax(db: crate::DbId, key: *const u8, key_len: u32) -> u32;
+    pub fn kvMax(db: KvHandle, key: *const u8, key_len: u32) -> u32;
+
+    /// Gets the current value of a clock in nanoseconds.
+    ///
+    /// This function is non-deterministic and is only available in subjective services.
+    ///
+    /// The following clocks are supported
+    /// - `__WASI_CLOCKID_REALTIME` returns wall-clock time since the unix epoch.
+    /// - `__WASI_CLOCKID_MONOTONIC` returns monotonic time since an unspecified epoch.
+    ///   All uses of CLOCK_MONOTONIC within the same block use the same epoch.
+    /// - `__WASI_CLOCKID_PROCESS_CPUTIME_ID` measures CPU time spent executing the
+    ///   current transaction.
+    ///
+    /// Returns 0 on success or an error code on failure.
+    ///
+    /// Errors:
+    /// - `EINVAL`: the clock id is not supported
+    pub fn clockTimeGet(id: u32, time: *mut u64) -> i32;
+
+    /// Fills a buffer with random bytes
+    ///
+    /// This function is non-deterministic and is only available in subjective services.
+    pub fn getRandom(buf: *mut u8, len: usize);
+
+    /// Sets the CPU timer to expire after the current transaction/query/callback
+    /// context has run for a given number of nanoseconds. When the timer
+    /// expires, the current context will be terminated. Setting the timeout
+    /// replaces any previous timeout.
+    pub fn setMaxCpuTime(ns: u64);
+
+    pub fn checkoutSubjective();
+    pub fn commitSubjective() -> bool;
+    pub fn abortSubjective();
+
+    /// Starts a new HTTP request
+    ///
+    /// Returns a socket on success or a negative error code on failure
+    ///
+    /// Errors:
+    /// - `ENOSYS`: the host does not support sockets
+    pub fn socketOpen(data: *const u8, len: usize) -> i32;
+
+    /// Send a message to a socket
+    ///
+    /// Returns 0 on success or an error code on failure
+    ///
+    /// Errors:
+    /// - `EBADF`: fd is not a valid file descriptor
+    /// - `ENOTSOCK`: fd is not a socket
+    pub fn socketSend(fd: i32, data: *const u8, len: usize) -> i32;
+
+    /// Change flags on a socket. The mask determines which flags are set.
+    ///
+    /// If this function is called within a subjectiveCheckout, it will only take
+    /// effect if the top-level commit succeeds. If another context changes the
+    /// flags, subjectiveCommit may fail.
+    ///
+    /// Returns 0 on success or an error code on failure.
+    ///
+    /// Errors:
+    /// - `EBADF`: fd is not a valid file descriptor
+    /// - `ENOTSUP`: The socket does not support the requested flags
+    /// - `ENOTSOCK`: fd is not a socket
+    /// - `EACCES`: The socket is owned by another context
+    pub fn socketSetFlags(fd: i32, mask: u32, value: u32) -> i32;
 }

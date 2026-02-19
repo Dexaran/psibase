@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.16.3)
+cmake_policy(VERSION 3.16.3...3.31.6)
 project(psibase)
 include(ExternalProject)
 
@@ -10,6 +11,9 @@ if(NOT DEFINED WASI_SDK_PREFIX AND DEFINED ENV{WASI_SDK_PREFIX})
     set(WASI_SDK_PREFIX $ENV{WASI_SDK_PREFIX})
 endif()
 
+if(NOT DEFINED ICU_LIBRARY_DIR )
+    set(ICU_LIBRARY_DIR $ENV{ICU_LIBRARY_DIR})
+endif()
 
 option (FORCE_COLORED_OUTPUT "Always produce ANSI-colored output (GNU/Clang only)." TRUE)
 if (${FORCE_COLORED_OUTPUT})
@@ -22,20 +26,128 @@ endif ()
 
 file(WRITE ${CMAKE_BINARY_DIR}/CTestTestfile.cmake)
 
-option(CLIO_ONLY "Only build clio" OFF)
+option(BUILD_STATIC "Build static binaries" OFF)
+option(ENABLE_SSL "Build psinode with TLS support" ON)
 
-option(BUILD_NATIVE "Build native code" ON)
-if(BUILD_NATIVE)
-    add_subdirectory(native)
-    file(APPEND ${CMAKE_BINARY_DIR}/CTestTestfile.cmake "subdirs(\"native\")\n")
-endif()
+add_subdirectory(native)
+add_subdirectory(rust)
+file(APPEND ${CMAKE_BINARY_DIR}/CTestTestfile.cmake "subdirs(\"native\" \"rust\")\n")
 
-option(BUILD_RELEASE_WASM "Build release wasms" ON)
 option(BUILD_DEBUG_WASM "Build debug wasms" OFF)
 
-if(DEFINED WASI_SDK_PREFIX AND NOT CLIO_ONLY)
+include(GNUInstallDirs)
+
+if(DEFINED WASI_SDK_PREFIX)
+    install(DIRECTORY ${WASI_SDK_PREFIX}/ USE_SOURCE_PERMISSIONS DESTINATION . COMPONENT WASI EXCLUDE_FROM_ALL)
+elseif(${CMAKE_HOST_SYSTEM_NAME} STREQUAL "Linux")
+    if (${CMAKE_HOST_SYSTEM_PROCESSOR} STREQUAL "x86_64")
+        set(WASI_SDK_URL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-29/wasi-sdk-29.0-x86_64-linux.tar.gz)
+        set(WASI_SDK_SHA256 87d1d1a2879d139cdc624b968efad3d4a97b8078cdff95e63ac88ecafd1a0171)
+    elseif(${CMAKE_HOST_SYSTEM_PROCESSOR} MATCHES "^(arm|aarch).*" )
+        set(WASI_SDK_URL https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-29/wasi-sdk-29.0-arm64-linux.tar.gz)
+        set(WASI_SDK_SHA256 052ad773397dc9e5aa99fb4cfef694175e6b1e81bb2ad1d3c8e7b3fc81441b7c)
+    endif()
+    if(DEFINED WASI_SDK_URL)
+        ExternalProject_Add(wasi-sdk
+            URL ${WASI_SDK_URL}
+            URL_HASH SHA256=${WASI_SDK_SHA256}
+            CONFIGURE_COMMAND ""
+            BUILD_COMMAND ""
+            INSTALL_COMMAND ""
+        )
+
+        ExternalProject_Get_Property(wasi-sdk SOURCE_DIR)
+        set(WASI_SDK_PREFIX ${SOURCE_DIR})
+        set(wasm-deps wasi-sdk)
+        install(DIRECTORY ${WASI_SDK_PREFIX}/ USE_SOURCE_PERMISSIONS DESTINATION . COMPONENT WASI)
+    endif()
+endif()
+
+if(DEFINED WASI_SDK_PREFIX)
+    ProcessorCount(NUM_PROCS)
+    # This is used by the VerifySig service. The kinds of keys supported need to be configured
+    # here.  We use a minimized build to keep the size of the service down. Static linking is
+    # not enough because the algorithms are looked up dynamically.
+    #
+    # --cpu=generic is used instead of --cpu=wasm, because Botan thinks that wasm means emscripten.
+    # --cc=gcc is used instead of clang, because Botan's clang configration includes -pthread.
+    # The stack protector requires an entropy source so we can't support it.
+    #  -msimd128 is disabled because binaryen 105 doesn't fully support it
+    ExternalProject_Add(wasm-botan
+        URL https://github.com/gofractally/psibase/releases/download/deps/Botan-3.1.1.tar.xz
+        URL_HASH SHA256=30c84fe919936a98fef5331f246c62aa2c0e4d2085b2d4511207f6a20afa3a6b
+        DEPENDS ${wasm-deps}
+        PREFIX ${CMAKE_CURRENT_BINARY_DIR}/wasm/botan
+        INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wasm/deps
+        CONFIGURE_COMMAND <SOURCE_DIR>/configure.py --cc-bin=${WASI_SDK_PREFIX}/bin/clang++ --cc=gcc --cpu=generic --os=none --ar-command=${WASI_SDK_PREFIX}/bin/llvm-ar --build-targets=static --with-sysroot-dir=${WASI_SDK_PREFIX}/share/wasi-sysroot --minimized-build --enable-modules=ecdsa,raw_hash,auto_rng,sha2_64,getentropy --with-os-feature=getentropy "--cxxflags=--target=wasm32-wasip1 -O3 -msign-ext -mnontrapping-fptoint -mbulk-memory" --without-stack-protector --prefix=<INSTALL_DIR>
+        BUILD_COMMAND make -j${NUM_PROCS}
+        INSTALL_COMMAND make install
+    )
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/wasm/deps/lib/libbotan-3.a
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/wasi-sysroot/lib
+        COMPONENT libpsibase
+    )
+    install(DIRECTORY ${CMAKE_BINARY_DIR}/wasm/deps/include/botan-3
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/wasi-sysroot/include
+        COMPONENT libpsibase
+    )
+
+    ExternalProject_Add(wasm-catch2
+        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/Catch2
+        BINARY_DIR catch2
+        TEST_EXCLUDE_FROM_MAIN 1
+        EXCLUDE_FROM_ALL 1
+        DEPENDS ${wasm-deps}
+        PREFIX ${CMAKE_CURRENT_BINARY_DIR}/wasm/catch2
+        INSTALL_DIR ${CMAKE_CURRENT_BINARY_DIR}/wasm/deps
+        CMAKE_ARGS
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
+            -DBUILD_TESTING=OFF
+            -DCATCH_INSTALL_DOCS=OFF
+            -DCATCH_INSTALL_EXTRAS=OFF
+            -DCATCH_CONFIG_NO_POSIX_SIGNALS=ON
+            -DCMAKE_C_COMPILER_LAUNCHER=${CMAKE_C_COMPILER_LAUNCHER}
+            -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
+            -DCMAKE_TOOLCHAIN_FILE=${CMAKE_CURRENT_SOURCE_DIR}/wasm/toolchain.cmake
+            -DWASI_SDK_PREFIX=${WASI_SDK_PREFIX}
+            -DWASM_CLANG_PREFIX=${WASM_CLANG_PREFIX}
+            -DWASM_CLANG_SUFFIX=${WASM_CLANG_SUFFIX}
+            -DCMAKE_SYSROOT=${WASI_SDK_PREFIX}/share/wasi-sysroot
+    )
+    install(
+        FILES ${CMAKE_CURRENT_BINARY_DIR}/wasm/deps/lib/libCatch2.a
+              ${CMAKE_CURRENT_BINARY_DIR}/wasm/deps/lib/libCatch2Main.a
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/wasi-sysroot/lib
+        COMPONENT libpsibase
+    )
+    install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wasm/deps/lib/cmake/Catch2
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/wasi-sysroot/lib/cmake
+        COMPONENT libpsibase
+    )
+    install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/wasm/deps/include/catch2
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/wasi-sysroot/include
+        COMPONENT libpsibase
+    )
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/external/Catch2/LICENSE.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/psibase/licenses RENAME LICENSE.catch2 COMPONENT libpsibase)
+
+    set(SERVICES Accounts AuthDelegate AuthSig AuthAny CommonApi
+        CpuLimit Db Events EventIndex Explorer Invite
+        Nop Packages Producers HttpServer Sites RAccounts
+        RAuthSig RAuthDelegate REvents RInvite RPackages RProducers
+        RHttpServer RSetCode RTransact SetCode
+        Transact VerifySig XAdmin XDb XHttp XRun XSites XTimer XTransact
+        PSubjectiveService CounterService AsyncQueryService
+        SubjectiveCounterService KeepSocketService Loop
+        XPackages XProxy XSocketListService WSEcho XDelay)
+    set(WASM_BYPRODUCTS)
+    foreach(s ${SERVICES})
+        list(APPEND WASM_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/${s}.wasm ${CMAKE_CURRENT_BINARY_DIR}/${s}-schema.json)
+    endforeach()
+
     ExternalProject_Add(wasm
         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/wasm
+        DEPENDS ${wasm-deps} wasm-botan wasm-catch2 psitest
         BINARY_DIR wasm
         INSTALL_COMMAND ""
         BUILD_ALWAYS 1
@@ -43,7 +155,7 @@ if(DEFINED WASI_SDK_PREFIX AND NOT CLIO_ONLY)
         STEP_TARGETS configure
         CMAKE_ARGS
             -DCMAKE_BUILD_TYPE=
-            -DBUILD_RELEASE_WASM=${BUILD_RELEASE_WASM}
+            -DBUILD_RELEASE_WASM=ON
             -DBUILD_DEBUG_WASM=${BUILD_DEBUG_WASM}
             -DCMAKE_TARGET_MESSAGES=${CMAKE_TARGET_MESSAGES}
             -DCMAKE_TOOLCHAIN_FILE=${CMAKE_CURRENT_SOURCE_DIR}/wasm/toolchain.cmake
@@ -56,151 +168,1192 @@ if(DEFINED WASI_SDK_PREFIX AND NOT CLIO_ONLY)
             -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
             -DCMAKE_FIND_ROOT_PATH=${CMAKE_CURRENT_BINARY_DIR}/wasm/deps
             -DCMAKE_PREFIX_PATH=/
+            -DCMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX}
+            -DCMAKE_INSTALL_INCLUDEDIR=${CMAKE_INSTALL_DATADIR}/wasi-sysroot/include
+            -DCMAKE_INSTALL_LIBDIR=${CMAKE_INSTALL_DATADIR}/wasi-sysroot/lib
+            -DPSITEST_EXECUTABLE=$<TARGET_FILE:psitest>
+        BUILD_BYPRODUCTS ${WASM_BYPRODUCTS}
     )
     file(APPEND ${CMAKE_BINARY_DIR}/CTestTestfile.cmake "subdirs(\"wasm\")\n")
     ExternalProject_Add_StepTargets(wasm test)
+    install(CODE "include(${CMAKE_CURRENT_BINARY_DIR}/wasm/cmake_install.cmake)" COMPONENT libpsibase)
 else()
     message(WARNING "WASI_SDK_PREFIX isn't defined; skipping wasm")
 endif()
 
-option(BUILD_DOC "Build doc" OFF)
-if(BUILD_DOC)
-    set(DOC_DEP doc)
-    ExternalProject_Add(
-        gen-cpp-doc
-        DEPENDS             wasm
-        SOURCE_DIR          ${CMAKE_CURRENT_SOURCE_DIR}/rust
-        CONFIGURE_COMMAND   ""
-        BUILD_COMMAND       cargo build -r --bin gen-cpp-doc --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml --target-dir ${CMAKE_CURRENT_BINARY_DIR}/rust
-        INSTALL_COMMAND     ""
-    )
-    configure_file(doc/psidk/book.toml.in doc/psidk/book.toml)
-    configure_file(doc/psidk/mermaid.min.js doc/psidk/mermaid.min.js COPYONLY)
-    configure_file(doc/psidk/mermaid-init.js doc/psidk/mermaid-init.js COPYONLY)
-    ExternalProject_Add(
-        ${DOC_DEP}
-        DEPENDS             gen-cpp-doc
-        SOURCE_DIR          ${CMAKE_CURRENT_SOURCE_DIR}/doc/psidk
-        CONFIGURE_COMMAND   ""
-        BUILD_COMMAND       export WASI_SDK_PREFIX=${WASI_SDK_PREFIX} && cd ${CMAKE_CURRENT_SOURCE_DIR}/doc/psidk && rm -rf ${CMAKE_CURRENT_BINARY_DIR}/book && mdbook build -d ${CMAKE_CURRENT_BINARY_DIR}/book ${CMAKE_CURRENT_BINARY_DIR}/doc/psidk
-        INSTALL_COMMAND     ""
-    )
-endif()
-
-set(JS_DIRS
-    services/system/AccountSys/ui:AccountSys_js
-    services/user/PsiSpaceSys/ui:PsiSpaceSys_js
-    services/user/CommonSys/ui:CommonSys_js
-    services/user/TokenSys/ui:TokenSys_js
-    services/user/ExploreSys/ui:ExploreSys_js
-    services/user/AdminSys/ui:AdminSys_js
+# Documentation
+ExternalProject_Add(
+    gen-cpp-doc
+    DEPENDS             wasm
+    SOURCE_DIR          ${CMAKE_CURRENT_SOURCE_DIR}/rust
+    CONFIGURE_COMMAND   ""
+    BUILD_COMMAND       cargo build -r --bin gen-cpp-doc --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml --target-dir ${CMAKE_CURRENT_BINARY_DIR}/rust
+    INSTALL_COMMAND     ""
+)
+ExternalProject_Add(
+    md2man
+    SOURCE_DIR          ${CMAKE_CURRENT_SOURCE_DIR}/rust
+    CONFIGURE_COMMAND   ""
+    BUILD_COMMAND       cargo build -r --bin md2man --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml --target-dir ${CMAKE_CURRENT_BINARY_DIR}/rust
+    BUILD_ALWAYS        1
+    INSTALL_COMMAND     ""
 )
 
-option(BUILD_JS "Build JS" ON)
-if(BUILD_JS)
-    list(TRANSFORM JS_DIRS REPLACE "^[^:]+:([^:]+)$" \\1 OUTPUT_VARIABLE JS_DEPS)
-    foreach(ENTRY ${JS_DIRS})
-        string(REGEX REPLACE "^([^:]+):([^:]+)$" \\1 PATH ${ENTRY})
-        string(REGEX REPLACE "^([^:]+):([^:]+)$" \\2 DEP ${ENTRY})
-        add_custom_target(
-            ${DEP}
-            COMMAND cd ${CMAKE_CURRENT_SOURCE_DIR}/${PATH} && yarn && yarn build
-        )
-    endforeach()
-endif()
+function(ADD_BOOK_FILES path extension)
+    file(COPY ${CMAKE_CURRENT_SOURCE_DIR}${path} DESTINATION ${CMAKE_CURRENT_BINARY_DIR}${path})
+    file(GLOB DOC_FILES ${CMAKE_CURRENT_BINARY_DIR}${path}*.${extension})
+    set(doc-src ${doc-src} ${DOC_FILES} PARENT_SCOPE)
+endfunction()
 
-if(BUILD_JS)
-    function(psinode_files target pfx)
+configure_file(doc/book.toml.in doc/book.toml)
+configure_file(doc/theme/index.hbs doc/theme/index.hbs)
+ADD_BOOK_FILES("/doc/theme/js/" "js")
+ADD_BOOK_FILES("/doc/theme/css/" "css")
+ADD_BOOK_FILES("/doc/src/_img/" "svg")
+
+file(GLOB_RECURSE doc-src ${CMAKE_CURRENT_SOURCE_DIR}/doc/src/*.md)
+list(APPEND doc-src ${CMAKE_CURRENT_BINARY_DIR}/doc/book.toml)
+
+file(GLOB_RECURSE doc-cpp ${CMAKE_CURRENT_SOURCE_DIR}/doc/src/development/services/cpp-service/*.cpp)
+file(GLOB_RECURSE doc-cmake doc/src/development/services/cpp-service/*/CMakeLists.txt)
+file(GLOB doc-headers libraries/psibase/common/include/psibase/*.hpp)
+file(GLOB doc-service-headers packages/*/*/include/services/*/*.hpp)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/book/html/index.html
+    BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/book/html
+    DEPENDS gen-cpp-doc ${doc-src} ${doc-cpp} ${doc-cmake} ${doc-headers} ${doc-service-headers}
+    COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_CURRENT_BINARY_DIR}/book
+    COMMAND mdbook build -d ${CMAKE_CURRENT_BINARY_DIR}/book ${CMAKE_CURRENT_BINARY_DIR}/doc
+    COMMAND find ${CMAKE_CURRENT_BINARY_DIR}/book "(" -name ".*" -o -name "*~" ")" -delete
+    VERBATIM
+)
+add_custom_target(
+    doc
+    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/book/html/index.html
+)
+
+function(add_manpage name)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/doc/${name}.1
+        DEPENDS md2man doc/src/run-infrastructure/cli/${name}.md
+        COMMAND ${CMAKE_CURRENT_BINARY_DIR}/rust/release/md2man < ${CMAKE_CURRENT_SOURCE_DIR}/doc/src/run-infrastructure/cli/${name}.md > ${CMAKE_CURRENT_BINARY_DIR}/doc/${name}.1
+    )
+    add_custom_target(${name}.1 ALL DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/doc/${name}.1)
+    install(FILES ${CMAKE_CURRENT_BINARY_DIR}/doc/${name}.1 TYPE MAN COMPONENT Client)
+endfunction()
+
+add_manpage(psinode)
+add_manpage(psibase)
+add_manpage(psibase-create-snapshot)
+add_manpage(psibase-load-snapshot)
+
+# Cargo psibase
+ExternalProject_Add(
+    cargo-psibase
+    SOURCE_DIR          ${CMAKE_CURRENT_SOURCE_DIR}/rust
+    CONFIGURE_COMMAND   ""
+    BUILD_COMMAND       cargo build -r --bin cargo-psibase --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml --target-dir ${CMAKE_CURRENT_BINARY_DIR}/rust
+    BUILD_BYPRODUCTS    ${CMAKE_CURRENT_BINARY_DIR}/rust/release/cargo-psibase
+    BUILD_ALWAYS        1
+    INSTALL_COMMAND     ""
+)
+
+include(web-apps.cmake)
+
+# Static (not built) resource dependencies
+file(GLOB plugin-wit LIST_DIRECTORIES false ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/CommonApi/common/packages/wit/*)
+
+# Build each component
+include(libraries/psibase/sdk/rs-components.cmake)
+add_rs_component(packages/user/CommonApi/common/packages/component-parser:ComponentParser component_parser.wasm wasm32-unknown-unknown)
+add_dependencies(CommonApiCommonLib_js ComponentParser)
+
+add_rs_component_workspace(packages/:Plugins 
+    accounts
+    aes
+    auth-any
+    auth-delegate
+    auth-sig
+    base64
+    kdf
+    setcode
+    clientdata
+    invite
+    packages
+    permissions
+    sites
+    host-common
+    host-prompt
+    host-types
+    host-auth
+    host-crypto
+    web-crypto
+    transact
+    workshop
+    fractal-core
+    config
+    producers
+)
+
+function(psinode_files target pfx)
     add_custom_target(
     ${target}
     ALL
-    DEPENDS AdminSys_js
-    COMMAND rm -rf ${pfx}/share/psibase/services/admin-sys
-    COMMAND mkdir -p ${pfx}/share/psibase/services/admin-sys/common
-    COMMAND cp -a -T ${CMAKE_CURRENT_SOURCE_DIR}/services/user/AdminSys/ui/dist ${pfx}/share/psibase/services/admin-sys
-    COMMAND cp -a -T ${CMAKE_CURRENT_SOURCE_DIR}/services/user/CommonSys/common/fonts ${pfx}/share/psibase/services/admin-sys/common/fonts
-    COMMAND cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/user/CommonSys/common/rpc.mjs ${pfx}/share/psibase/services/admin-sys/common/
-    COMMAND cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/user/CommonSys/common/keyConversions.mjs ${pfx}/share/psibase/services/admin-sys/common/
+    DEPENDS ${XAdmin_js_DEP} wasm
+    COMMAND rm -rf ${pfx}/share/psibase/services/x-admin
+    COMMAND mkdir -p ${pfx}/share/psibase/services/x-admin
     COMMAND cp ${CMAKE_CURRENT_SOURCE_DIR}/programs/psinode/config.in ${pfx}/share/psibase/config.in
+    COMMAND ${CMAKE_COMMAND} -E create_symlink ../../packages ${pfx}/share/psibase/services/x-admin/packages
     )
-    endfunction()
+endfunction()
 
-    psinode_files(psinode-share ${CMAKE_CURRENT_BINARY_DIR})
-    psinode_files(psinode-psidk-share ${CMAKE_CURRENT_BINARY_DIR}/psidk)
-endif()
+psinode_files(psinode-share ${CMAKE_CURRENT_BINARY_DIR})
 
-option(BUILD_RUST "Build rust" ON)
-if(BUILD_RUST)
-    set(BOOT_IMAGE ${CMAKE_CURRENT_SOURCE_DIR}/rust/psibase/boot-image)
-    set(COMMON_SYS ${CMAKE_CURRENT_SOURCE_DIR}/services/user/CommonSys)
-    set(THIRD_SRC ${COMMON_SYS}/common/thirdParty/src)
-    set(THIRD_DEST ${BOOT_IMAGE}/CommonSys/common/thirdParty)
-    ExternalProject_Add(
-        rust
-        DEPENDS wasm ${DOC_DEP} ${JS_DEPS}
-        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rust
-        CONFIGURE_COMMAND ""
-        BUILD_COMMAND   rm -rf ${BOOT_IMAGE}
-        COMMAND         mkdir -p ${BOOT_IMAGE}/CommonSys/common ${BOOT_IMAGE}/CommonSys/common/fonts ${BOOT_IMAGE}/CommonSys/ui/vanilla
-        COMMAND         mkdir -p ${BOOT_IMAGE}/AccountSys/ui ${BOOT_IMAGE}/AdminSys/ui ${BOOT_IMAGE}/ExploreSys/ui
-        COMMAND         mkdir -p ${BOOT_IMAGE}/AuthEcSys ${BOOT_IMAGE}/TokenSys/ui ${BOOT_IMAGE}/PsiSpaceSys/ui
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/AccountSys.wasm                   ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/AdminSys.wasm                     ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/AuthEcSys.wasm                    ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/AuthAnySys.wasm                   ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/CommonSys.wasm                    ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/ExploreSys.wasm                   ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/NftSys.wasm                       ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/ProducerSys.wasm                  ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/ProxySys.wasm                     ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/PsiSpaceSys.wasm                  ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/RAccountSys.wasm                  ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/RAuthEcSys.wasm                   ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/RProducerSys.wasm                 ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/RProxySys.wasm                    ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/RTokenSys.wasm                    ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/SetCodeSys.wasm                   ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/SymbolSys.wasm                    ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/TokenSys.wasm                     ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/TransactionSys.wasm               ${BOOT_IMAGE}
-        COMMAND         cp -a ${CMAKE_CURRENT_BINARY_DIR}/VerifyEcSys.wasm                  ${BOOT_IMAGE}
+include(GNUInstallDirs)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/share/psibase/services/x-admin/packages DESTINATION ${CMAKE_INSTALL_DATADIR}/psibase/services/x-admin COMPONENT ServerData)
 
-        COMMAND         cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/system/AccountSys/ui/dist    ${BOOT_IMAGE}/AccountSys/ui/dist
-        COMMAND         bash -c "cp -a ${COMMON_SYS}/common/*.mjs                               ${BOOT_IMAGE}/CommonSys/common/"
-        COMMAND         bash -c "cp -a ${COMMON_SYS}/common/fonts/*                             ${BOOT_IMAGE}/CommonSys/common/fonts/"
-        COMMAND         cp -a ${COMMON_SYS}/ui/vanilla/common.index.html                        ${BOOT_IMAGE}/CommonSys/ui/vanilla
-        COMMAND         cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/user/CommonSys/ui/dist       ${BOOT_IMAGE}/CommonSys/ui/dist
-        COMMAND         cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/user/ExploreSys/ui/dist      ${BOOT_IMAGE}/ExploreSys/ui/dist
-        COMMAND         cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/user/TokenSys/ui/dist        ${BOOT_IMAGE}/TokenSys/ui/dist
-        COMMAND         cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/user/PsiSpaceSys/ui/dist     ${BOOT_IMAGE}/PsiSpaceSys/ui/dist
-        COMMAND         cp -a ${CMAKE_CURRENT_SOURCE_DIR}/services/user/AdminSys/ui/dist        ${BOOT_IMAGE}/AdminSys/ui/dist
+# Build service packages
+include(libraries/psibase/sdk/pack_service.cmake)
 
-        COMMAND         bash -c "cp -a ${CMAKE_CURRENT_BINARY_DIR}/book                     ${BOOT_IMAGE}/doc || mkdir -p ${BOOT_IMAGE}/doc"
+set(SERVICE_DIR ${CMAKE_CURRENT_BINARY_DIR}/share/psibase/packages)
+set(USER_WORKSPACE_TARGET ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/target)
+set(SYSTEM_WORKSPACE_TARGET ${CMAKE_CURRENT_SOURCE_DIR}/packages/system/target)
 
-        COMMAND         rm -rf ${THIRD_DEST}
-        COMMAND         mkdir -p ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/htm.module.js                                    ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/iframeResizer.contentWindow.js                   ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/iframeResizer.js                                 ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/react-dom.development.js                         ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/react-dom.production.min.js                      ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/react-router-dom.min.js                          ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/react.development.js                             ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/react.production.min.js                          ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/semantic-ui-react.min.js                         ${THIRD_DEST}
-        COMMAND         cp -a ${THIRD_SRC}/useLocalStorageState.js                          ${THIRD_DEST}
+set(PSIBASE_VERSION 0.23)
 
-        COMMAND         touch ${CMAKE_CURRENT_SOURCE_DIR}/rust/psibase/src/boot.rs
-        COMMAND         cargo build -r --bin psibase --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml --target-dir ${CMAKE_CURRENT_BINARY_DIR}/rust
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Transact.psi
+    NAME Transact
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "All transactions enter the chain through this service"
+    SERVICE transact
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Transact.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Transact-schema.json
+        FLAGS isPrivileged
+        SERVER r-transact
+        DATA ${Plugins_OUTPUT_FILE_transact} /plugin.wasm
+    SERVICE r-transact
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RTransact.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RTransact-schema.json
+        FLAGS isPrivileged
+    POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/system/Transact/src/postinstall.json
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "Accounts(^${PSIBASE_VERSION}.0)" "CpuLimit(^${PSIBASE_VERSION}.0)" "Db(^${PSIBASE_VERSION}.0)" "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)"
+)
 
-        INSTALL_COMMAND mkdir -p ${CMAKE_CURRENT_BINARY_DIR}/psidk/bin
-        COMMAND cp ${CMAKE_CURRENT_BINARY_DIR}/rust/release/psibase ${CMAKE_CURRENT_BINARY_DIR}/psidk/bin
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Accounts.psi
+    NAME Accounts
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "This service facilitates the creation of new accounts"
+    SERVICE accounts
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Accounts.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Accounts-schema.json
+        SERVER r-accounts
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/system/Accounts/ui/dist/* /
+        DATA ${Plugins_OUTPUT_FILE_accounts} /plugin.wasm
+        POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/system/Accounts/postinstall.json
+    SERVICE r-accounts
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RAccounts.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RAccounts-schema.json
+    DEPENDS ${Accounts_js_DEP}
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "AuthAny(^${PSIBASE_VERSION}.0)" "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Base64.psi
+    NAME Base64
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Base64 encoding and decoding"
+    PACKAGE_DEPENDS "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)"
+    SERVICE base64
+        DATA ${Plugins_OUTPUT_FILE_base64} /plugin.wasm
+    DEPENDS ${Plugins_DEP}
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Kdf.psi
+    NAME Kdf
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Key Derivation Function"
+    PACKAGE_DEPENDS "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)"
+    SERVICE kdf
+        DATA ${Plugins_OUTPUT_FILE_kdf} /plugin.wasm
+    DEPENDS ${Plugins_DEP}
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Aes.psi
+    NAME Aes
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "AES encryption"
+    PACKAGE_DEPENDS "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)"
+    SERVICE aes
+        DATA ${Plugins_OUTPUT_FILE_aes} /plugin.wasm
+    DEPENDS ${Plugins_DEP}
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/ClientData.psi
+    NAME ClientData
+    DESCRIPTION "Plugin for enabling simpler interactions with client-side data storage"
+    VERSION ${PSIBASE_VERSION}.0
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)" "CommonApi(^${PSIBASE_VERSION}.0)" "Supervisor(^${PSIBASE_VERSION}.0)"
+    SERVICE clientdata
+        DATA ${Plugins_OUTPUT_FILE_clientdata} /plugin.wasm
+    DEPENDS ${Plugins_DEP}
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/WebCrypto.psi
+    NAME WebCrypto
+    DESCRIPTION "Plugin that provides a shim for browser's SubtleCrypto api"
+    VERSION ${PSIBASE_VERSION}.0
+    SERVICE webcrypto
+        DATA ${Plugins_OUTPUT_FILE_web_crypto} /plugin.wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)"
+)
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Host.psi
+    NAME Host
+    DESCRIPTION "Plugin that acts as the bridge to the host environment"
+    VERSION ${PSIBASE_VERSION}.0
+    ACCOUNTS wasi # This name would be overshadowed
+    SERVICE host
+        DATA ${Plugins_OUTPUT_FILE_host_common} /common.wasm
+        DATA ${Plugins_OUTPUT_FILE_host_prompt} /prompt.wasm
+        DATA ${Plugins_OUTPUT_FILE_host_types} /types.wasm
+        DATA ${Plugins_OUTPUT_FILE_host_auth} /auth.wasm
+        DATA ${Plugins_OUTPUT_FILE_host_crypto} /crypto.wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)"
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/AuthDyn.psi
+    PATH packages/system/AuthDyn
+    TARGET_DIR ${SYSTEM_WORKSPACE_TARGET}
+)
+
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Chainmail.psi
+    PATH packages/user/Chainmail
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Symbol.psi
+    PATH packages/user/Symbol
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Credentials.psi
+    PATH packages/system/Credentials
+    TARGET_DIR ${SYSTEM_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/TokenStream.psi
+    PATH packages/user/TokenStream
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+    DEPENDS ${TokenStream_js_DEP}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/DiffAdjust.psi
+    PATH packages/user/DiffAdjust
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Profiles.psi
+    PATH packages/user/Profiles
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Evaluations.psi
+    PATH packages/user/Evaluations
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+    DEPENDS ${Evaluations_js_DEP}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Nft.psi
+    PATH packages/user/Nft
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Tokens.psi
+    PATH packages/user/Tokens
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Fractals.psi
+    PATH packages/user/Fractals
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+    DEPENDS ${Fractals_js_DEP}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Branding.psi
+    PATH packages/user/Branding
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/BrotliCodec.psi
+    PATH packages/user/BrotliCodec
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/FaucetTok.psi
+    PATH packages/user/FaucetTok
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/VirtualServer.psi
+    PATH packages/system/VirtualServer
+    TARGET_DIR ${SYSTEM_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Registry.psi
+    PATH packages/user/Registry
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/StagedTx.psi
+    PATH packages/system/StagedTx
+    TARGET_DIR  ${SYSTEM_WORKSPACE_TARGET}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Subgroups.psi
+    PATH packages/user/Subgroups
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/AuthSig.psi
+    NAME AuthSig
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Auth service using Botan to verify signatures"
+    SERVICE auth-sig
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/AuthSig.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/AuthSig-schema.json
+        DATA ${Plugins_OUTPUT_FILE_auth_sig} /plugin.wasm
+        SERVER r-auth-sig
+    SERVICE r-auth-sig
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RAuthSig.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RAuthSig-schema.json
+    SERVICE verify-sig
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/VerifySig.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/VerifySig-schema.json
+        FLAGS isVerify
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)"
+    # This dependency is removed as a hack to get tests to pass in CICD.
+    # Test boots don't load UI elements, so the setCsp Permissions calls, fails
+    # "Permissions(^${PSIBASE_VERSION}.0)"
+)
+
+set(COMMON_API ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/CommonApi)
+set(THIRD_SRC ${COMMON_API}/common/resources/thirdParty/src)
+set(THIRD_FILES
+    ${THIRD_SRC}/htm.module.js
+    ${THIRD_SRC}/react-dom.development.js
+    ${THIRD_SRC}/react-dom.production.min.js
+    ${THIRD_SRC}/react-router-dom.min.js
+    ${THIRD_SRC}/react.development.js
+    ${THIRD_SRC}/react.production.min.js
+    ${THIRD_SRC}/semantic-ui-react.min.js
+    ${THIRD_SRC}/useLocalStorageState.js)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/CommonApi.psi
+    NAME CommonApi
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Service that contains the common files and libraries used by apps on psibase"
+    SERVICE common-api
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/CommonApi.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/CommonApi-schema.json
+        SERVER common-api
+        DATA      ${COMMON_API}/common/packages/common-lib/dist/common-lib.js common/common-lib.js
+        DATA GLOB ${COMMON_API}/common/resources/*.mjs                        common/
+        DATA      ${COMMON_API}/common/resources/fonts                        common/fonts
+        DATA GLOB ${THIRD_FILES}                                              common
+        DATA      ${COMPONENT_BIN_DIR}/${ComponentParser_OUTPUT_FILE}         /common/${ComponentParser_OUTPUT_FILE}
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/CommonApi/common/packages/plugin-tester/ui/dist/* /common/plugin-tester/
+    DEPENDS CommonApiCommonLib_js
+    DEPENDS ${ComponentParser_DEP}
+    DEPENDS ${PluginTester_js_DEP}
+    DEPENDS wasm
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/AuthDelegate.psi
+    NAME AuthDelegate
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Auth service that delegates authorization to another account"
+    SERVICE auth-delegate
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/AuthDelegate.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/AuthDelegate-schema.json
+        DATA ${Plugins_OUTPUT_FILE_auth_delegate} /plugin.wasm
+        SERVER r-auth-dlg
+    SERVICE r-auth-dlg
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RAuthDelegate.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RAuthDelegate-schema.json
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/AuthAny.psi
+    NAME AuthAny
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Insecure auth service that allows any access"
+    SERVICE auth-any
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/AuthAny.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/AuthAny-schema.json
+        DATA ${Plugins_OUTPUT_FILE_auth_any} /plugin.wasm
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "Sites(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/CpuLimit.psi
+    NAME CpuLimit
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Service that manages CPU billing"
+    SERVICE cpu-limit
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/CpuLimit.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/CpuLimit-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Db.psi
+    NAME Db
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Manages service access to the KV database"
+    SERVICE db
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Db.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Db-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Docs.psi
+    NAME Docs
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Psibase documentation"
+    SERVICE docs
+        DATA ${CMAKE_CURRENT_BINARY_DIR}/book/html /
+    PACKAGE_DEPENDS "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)"
+    DEPENDS doc ${CMAKE_CURRENT_BINARY_DIR}/book/html/index.html
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Homepage.psi
+    NAME Homepage
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Network homepage"
+    SERVICE homepage
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Homepage/ui/dist/*  /
+        POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Homepage/postinstall.json
+    PACKAGE_DEPENDS "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)" "Profiles(^${PSIBASE_VERSION}.0)"
+    DEPENDS ${Homepage_js_DEP}
+)
+
+cargo_psibase_package(
+    OUTPUT ${SERVICE_DIR}/Identity.psi
+    PATH packages/user/Identity
+    TARGET_DIR ${USER_WORKSPACE_TARGET}
+    DEPENDS ${Identity_js_DEP}
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Nop.psi
+    NAME Nop
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Service that does nothing"
+    SERVICE nop
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Nop.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Nop-schema.json
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Sites.psi
+    NAME Sites
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Provides web hosting to non-service accounts"
+    SERVICE sites
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Sites.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Sites-schema.json
+        SERVER sites
+        DATA ${Plugins_OUTPUT_FILE_sites} /plugin.wasm
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Producers.psi
+    NAME Producers
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Manages the active producers"
+    SERVICE producers
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Producers.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Producers-schema.json
+        DATA ${Plugins_OUTPUT_FILE_producers} /plugin.wasm
+        FLAGS isPrivileged
+        SERVER r-producers
+    SERVICE r-producers
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RProducers.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RProducers-schema.json
+    ACCOUNTS prods-weak prods-strong
+    POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/system/Producers/src/postinstall.json
+    DEPENDS wasm
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)" "StagedTx(^${PSIBASE_VERSION}.0)" "Transact(^${PSIBASE_VERSION}.0)" "AuthSig(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/HttpServer.psi
+    NAME HttpServer
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "The `http-server` service routes HTTP requests to the appropriate service"
+    SERVICE http-server
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/HttpServer.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/HttpServer-schema.json
+        SERVER rhttp-server
+        FLAGS isPrivileged
+    SERVICE rhttp-server
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RHttpServer.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RHttpServer-schema.json
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/SetCode.psi
+    NAME SetCode
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "All compiled code is uploaded to the chain through this service"
+    SERVICE setcode
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/SetCode.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/SetCode-schema.json
+        DATA ${Plugins_OUTPUT_FILE_setcode} /plugin.wasm
+        FLAGS isPrivileged
+        SERVER r-setcode
+        INIT
+    SERVICE r-setcode
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RSetCode.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RSetCode-schema.json
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Transact(^${PSIBASE_VERSION}.0)" "StagedTx(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)" "CommonApi(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Events.psi
+    NAME Events
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Indexes events and provides querying"
+    SERVICE events
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Events.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Events-schema.json
+        SERVER r-events
+    SERVICE event-index
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/EventIndex.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/EventIndex-schema.json
+    SERVICE r-events
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/REvents.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/REvents-schema.json
+        POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Events/src/postinstall.json
+    DEPENDS wasm
+    PACKAGE_DEPENDS "Transact(^${PSIBASE_VERSION}.0)" "HttpServer(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Explorer.psi
+    NAME Explorer
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Block explorer"
+    SERVICE explorer
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Explorer.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Explorer-schema.json
+        SERVER explorer
+        DATA ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Explorer/ui/dist /
+    DEPENDS ${Explorer_js_DEP}
+    DEPENDS wasm
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Invite.psi
+    NAME Invite
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Create invite links to apps. An invite can facilitate the creation of one or more new accounts."
+    PACKAGE_DEPENDS "Accounts(^${PSIBASE_VERSION}.0)" "HttpServer(^${PSIBASE_VERSION}.0)" "Nft(^${PSIBASE_VERSION}.0)" "Tokens(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)"
+    SERVICE invite
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Invite.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Invite-schema.json
+        SERVER r-invite
+        INIT
+        DATA ${Plugins_OUTPUT_FILE_invite} /plugin.wasm
+    SERVICE r-invite
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RInvite.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RInvite-schema.json
+    DEPENDS wasm
+    DEPENDS ${Plugins_DEP}
+)
+
+
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Supervisor.psi
+    NAME Supervisor
+    VERSION ${PSIBASE_VERSION}.0
+    PACKAGE_DEPENDS "Nft(^${PSIBASE_VERSION}.0)" "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)" "CommonApi(^${PSIBASE_VERSION}.0)"
+    SERVICE supervisor
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Supervisor/ui/dist/* /
+    DEPENDS ${Supervisor_js_DEP}
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Permissions.psi
+    NAME Permissions
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Handler for client-side permissions"
+    PACKAGE_DEPENDS "Sites(^${PSIBASE_VERSION}.0)" "CommonApi(^${PSIBASE_VERSION}.0)" "Accounts(^${PSIBASE_VERSION}.0)"
+    POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Permissions/postinstall.json
+    SERVICE permissions
+        DATA ${Plugins_OUTPUT_FILE_permissions} /plugin.wasm
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Permissions/ui/dist/* /
+    DEPENDS ${Permissions_js_DEP}
+    DEPENDS ${Plugins_DEP}
+)
+
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Workshop.psi
+    NAME Workshop
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "A dashboard for developers to create and manage apps"
+    PACKAGE_DEPENDS 
+        "HttpServer(^${PSIBASE_VERSION}.0)" 
+        "Sites(^${PSIBASE_VERSION}.0)" 
+        "Accounts(^${PSIBASE_VERSION}.0)" 
+        "CommonApi(^${PSIBASE_VERSION}.0)" 
+        "Registry(^${PSIBASE_VERSION}.0)" 
+        "StagedTx(^${PSIBASE_VERSION}.0)" 
+        "Transact(^${PSIBASE_VERSION}.0)"
+        "SetCode(^${PSIBASE_VERSION}.0)"
+        "Chainmail(^${PSIBASE_VERSION}.0)"
+        "ClientData(^${PSIBASE_VERSION}.0)"
+    SERVICE workshop
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Workshop/ui/dist/* /
+        DATA ${Plugins_OUTPUT_FILE_workshop} /plugin.wasm
+    DEPENDS ${Workshop_js_DEP}
+    DEPENDS ${Plugins_DEP}
+    POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Workshop/postinstall.json
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Config.psi
+    NAME Config
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "A dashboard for developers to create and manage apps"
+    PACKAGE_DEPENDS 
+        "HttpServer(^${PSIBASE_VERSION})" 
+        "Sites(^${PSIBASE_VERSION})" 
+        "Accounts(^${PSIBASE_VERSION})" 
+        "CommonApi(^${PSIBASE_VERSION})" 
+        "Registry(^${PSIBASE_VERSION})" 
+        "StagedTx(^${PSIBASE_VERSION})" 
+        "Transact(^${PSIBASE_VERSION})"
+        "SetCode(^${PSIBASE_VERSION})"
+        "Chainmail(^${PSIBASE_VERSION})"
+        "ClientData(^${PSIBASE_VERSION})"
+    SERVICE config
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Config/ui/dist/* /
+        DATA ${Plugins_OUTPUT_FILE_config} /plugin.wasm
+    DEPENDS ${Config_js_DEP}
+    DEPENDS ${Plugins_DEP}
+    POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Config/postinstall.json
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/FractalCore.psi
+    NAME FractalCore
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Vanilla fractal instance deployment"
+    PACKAGE_DEPENDS 
+        "HttpServer(^${PSIBASE_VERSION})" 
+        "Sites(^${PSIBASE_VERSION})" 
+        "Accounts(^${PSIBASE_VERSION})" 
+        "CommonApi(^${PSIBASE_VERSION})" 
+        "StagedTx(^${PSIBASE_VERSION})" 
+        "Transact(^${PSIBASE_VERSION})"
+        "Fractals(^${PSIBASE_VERSION})"
+    SERVICE fractal-core
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/FractalCore/ui/dist/* /
+        DATA ${Plugins_OUTPUT_FILE_fractal_core} /plugin.wasm
+    DEPENDS ${FractalCore_js_DEP}
+    DEPENDS ${Plugins_DEP}
+    POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/FractalCore/postinstall.json
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/TestFractal.psi
+    NAME TestFractal
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "A test fractal"
+    PACKAGE_DEPENDS "FractalCore(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION})" "Fractals(^${PSIBASE_VERSION})"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/TokenUsers.psi
+    NAME TokenUsers
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Creates accounts alice & bob, and gives each some system tokens. Not for production use."
+    PACKAGE_DEPENDS "Accounts(^${PSIBASE_VERSION}.0)" "FaucetTok(^${PSIBASE_VERSION}.0)" 
+    POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Tokens/src/TokenUsers.json
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Packages.psi
+    NAME Packages
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Package manager for psibase apps"
+    SERVICE packages
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Packages.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Packages-schema.json
+        SERVER r-packages
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/Packages/ui/dist/* /
+        DATA ${Plugins_OUTPUT_FILE_packages} /plugin.wasm
+    SERVICE r-packages
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/RPackages.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/RPackages-schema.json
+    DEPENDS wasm ${Packages_js_DEP} ${Plugins_DEP}
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)" "Sites(^${PSIBASE_VERSION}.0)" "Nop(^${PSIBASE_VERSION}.0)"
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XAdmin.psi
+    NAME XAdmin
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Dashboard for node administrators"
+    SERVICE x-admin
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XAdmin.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XAdmin-schema.json
+        FLAGS isPrivileged
+        SERVER x-admin
+        DATA GLOB ${CMAKE_CURRENT_SOURCE_DIR}/packages/local/XAdmin/ui/dist/* /
+        DATA ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/CommonApi/common/resources/fonts /common/fonts
+        DATA ${CMAKE_CURRENT_SOURCE_DIR}/packages/user/CommonApi/common/packages/common-lib/dist/common-lib.js /common/common-lib.js
+    DEPENDS wasm ${XAdmin_js_DEP}
+    PACKAGE_DEPENDS XHttp XSites
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XDb.psi
+    NAME XDb
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Manages access to subjective databases"
+    SERVICE x-db
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XDb.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XDb-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XHttp.psi
+    NAME XHttp
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Entry point for HTTP requests"
+    SERVICE x-http
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XHttp.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XHttp-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XPackages.psi
+    NAME XPackages
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Manages local packages"
+    SERVICE x-packages
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XPackages.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XPackages-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XRun.psi
+    NAME XRun
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Wrapper around the host API to dispatch asynchronous tasks"
+    SERVICE x-run
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XRun.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XRun-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XSites.psi
+    NAME XSites
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Manages static content for local services"
+    SERVICE x-sites
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XSites.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XSites-schema.json
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XTimer.psi
+    NAME XTimer
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Schedules asyncronous tasks"
+    SERVICE x-timer
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XTimer.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XTimer-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XTransact.psi
+    NAME XTransact
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Wrapper around the host API to apply transactions"
+    SERVICE x-transact
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XTransact.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XTransact-schema.json
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/DevDefault.psi
+    NAME DevDefault
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "All development packages"
+    PACKAGE_DEPENDS Accounts Aes AuthAny AuthDyn AuthSig AuthDelegate Base64 Branding BrotliCodec Chainmail ClientData CommonApi Config CpuLimit Credentials Db
+                    Docs DiffAdjust Evaluations Events Fractals FractalCore Explorer Homepage Host HttpServer Identity Invite Kdf Nft Packages Permissions Producers Profiles Registry 
+                    Sites SetCode StagedTx Subgroups Supervisor Symbol Tokens TestFractal TokenStream Transact VirtualServer WebCrypto Workshop
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/ProdDefault.psi
+    NAME ProdDefault
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "All production packages"
+    PACKAGE_DEPENDS Accounts Aes AuthAny AuthDyn AuthSig AuthDelegate Base64 Branding BrotliCodec Chainmail ClientData CommonApi Config CpuLimit Credentials Db
+                    Docs DiffAdjust Evaluations Events Explorer Fractals FractalCore Homepage Host HttpServer Invite Kdf Nft Packages Permissions Producers Profiles Registry
+                    Sites SetCode StagedTx Supervisor Symbol Tokens TokenStream Transact VirtualServer WebCrypto Workshop
+)
+
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/Minimal.psi
+    NAME Minimal
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Minimum packages for a functional chain"
+    PACKAGE_DEPENDS Accounts AuthDelegate AuthAny CpuLimit CommonApi Db Packages Producers HttpServer
+                    SetCode Transact VirtualServer
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/TestDefault.psi
+    NAME TestDefault
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Packages used in the tester"
+    PACKAGE_DEPENDS AuthSig BrotliCodec Db Events Minimal Nft Sites StagedTx Supervisor Symbol Tokens
+)
+
+psibase_package(
+    OUTPUT ${SERVICE_DIR}/XDefault.psi
+    NAME XDefault
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Default set of local packages to install on a new server"
+    PACKAGE_DEPENDS XHttp XAdmin XDb XPackages XRun XSites XTimer XTransact
+)
+
+function(write_package_index target dir)
+    set(deps ${CMAKE_CURRENT_SOURCE_DIR}/make_package_index.sh)
+    foreach(service IN LISTS ARGN)
+        list(APPEND deps ${service} ${dir}/${service}.psi)
+    endforeach()
+    add_custom_command(
+        OUTPUT ${dir}/index.json
+        DEPENDS ${deps}
+        COMMAND /usr/bin/bash ${CMAKE_CURRENT_SOURCE_DIR}/make_package_index.sh ${CMAKE_COMMAND} ${dir} ${ARGN} >${dir}/index.json
     )
-endif()
+    add_custom_target(${target} ALL DEPENDS ${dir}/index.json)
+endfunction()
+
+write_package_index(package-index ${SERVICE_DIR}
+    Accounts Aes AuthAny AuthDyn AuthDelegate AuthSig Base64 Branding BrotliCodec Chainmail ClientData CommonApi CpuLimit Credentials Db DevDefault ProdDefault
+    Docs DiffAdjust Events Evaluations FaucetTok Fractals FractalCore Explorer Host Identity Invite Kdf Nft Nop Minimal Packages Permissions Producers Profiles TestDefault HttpServer Registry 
+    Sites SetCode StagedTx Subgroups Supervisor Symbol TestFractal TokenUsers Tokens TokenStream Transact Homepage VirtualServer WebCrypto Workshop Config
+    XAdmin XDb XDefault XHttp XPackages XRun XSites XTimer XTransact)
+
+install(
+    FILES ${SERVICE_DIR}/index.json
+          ${SERVICE_DIR}/Accounts.psi
+          ${SERVICE_DIR}/Aes.psi
+          ${SERVICE_DIR}/AuthAny.psi
+          ${SERVICE_DIR}/AuthDyn.psi
+          ${SERVICE_DIR}/AuthDelegate.psi
+          ${SERVICE_DIR}/AuthSig.psi
+          ${SERVICE_DIR}/Base64.psi
+          ${SERVICE_DIR}/Branding.psi
+          ${SERVICE_DIR}/BrotliCodec.psi
+          ${SERVICE_DIR}/Chainmail.psi
+          ${SERVICE_DIR}/ClientData.psi
+          ${SERVICE_DIR}/CommonApi.psi
+          ${SERVICE_DIR}/Credentials.psi
+          ${SERVICE_DIR}/DevDefault.psi
+          ${SERVICE_DIR}/DiffAdjust.psi
+          ${SERVICE_DIR}/ProdDefault.psi
+          ${SERVICE_DIR}/CpuLimit.psi
+          ${SERVICE_DIR}/Db.psi
+          ${SERVICE_DIR}/Docs.psi
+          ${SERVICE_DIR}/Events.psi
+          ${SERVICE_DIR}/Evaluations.psi
+          ${SERVICE_DIR}/Explorer.psi
+          ${SERVICE_DIR}/FaucetTok.psi
+          ${SERVICE_DIR}/Fractals.psi
+          ${SERVICE_DIR}/FractalCore.psi
+          ${SERVICE_DIR}/Host.psi
+          ${SERVICE_DIR}/HttpServer.psi
+          ${SERVICE_DIR}/Homepage.psi
+          ${SERVICE_DIR}/Identity.psi
+          ${SERVICE_DIR}/Invite.psi
+          ${SERVICE_DIR}/Kdf.psi
+          ${SERVICE_DIR}/Minimal.psi
+          ${SERVICE_DIR}/Nft.psi
+          ${SERVICE_DIR}/Nop.psi
+          ${SERVICE_DIR}/Packages.psi
+          ${SERVICE_DIR}/Permissions.psi
+          ${SERVICE_DIR}/Producers.psi
+          ${SERVICE_DIR}/Profiles.psi
+          ${SERVICE_DIR}/Registry.psi
+          ${SERVICE_DIR}/SetCode.psi
+          ${SERVICE_DIR}/Sites.psi
+          ${SERVICE_DIR}/StagedTx.psi
+          ${SERVICE_DIR}/Subgroups.psi
+          ${SERVICE_DIR}/Supervisor.psi
+          ${SERVICE_DIR}/Symbol.psi
+          ${SERVICE_DIR}/TestDefault.psi
+          ${SERVICE_DIR}/TestFractal.psi
+          ${SERVICE_DIR}/Tokens.psi
+          ${SERVICE_DIR}/TokenStream.psi
+          ${SERVICE_DIR}/TokenUsers.psi
+          ${SERVICE_DIR}/Transact.psi
+          ${SERVICE_DIR}/VirtualServer.psi
+          ${SERVICE_DIR}/WebCrypto.psi
+          ${SERVICE_DIR}/Workshop.psi
+          ${SERVICE_DIR}/Config.psi
+          ${SERVICE_DIR}/XAdmin.psi
+          ${SERVICE_DIR}/XDb.psi
+          ${SERVICE_DIR}/XDefault.psi
+          ${SERVICE_DIR}/XHttp.psi
+          ${SERVICE_DIR}/XPackages.psi
+          ${SERVICE_DIR}/XRun.psi
+          ${SERVICE_DIR}/XSites.psi
+          ${SERVICE_DIR}/XTimer.psi
+          ${SERVICE_DIR}/XTransact.psi
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/psibase/packages/
+    COMPONENT ServerData)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/PSubjective.psi
+    NAME PSubjective
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Test service for parallel access to the subjective database"
+    SERVICE psubjective
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/PSubjectiveService.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/PSubjectiveService-schema.json
+        FLAGS isPrivileged
+        SERVER psubjective
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)"
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/Counter.psi
+    NAME Counter
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Test service than increments a counter"
+    SERVICE counter
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/CounterService.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/CounterService-schema.json
+        SERVER counter
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)"
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/AsyncQuery.psi
+    NAME AsyncQuery
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Test service for the various ways to respond to http requests"
+    SERVICE as-query
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/AsyncQueryService.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/AsyncQueryService-schema.json
+        SERVER as-query
+        POSTINSTALL ${CMAKE_CURRENT_SOURCE_DIR}/packages/psibase_tests/src/AsyncQueryService.json
+        FLAGS isPrivileged
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)"
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/SubjectiveCounter.psi
+    NAME SubjectiveCounter
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Test service that increments a counter in the subjective db"
+    SERVICE s-counter
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/SubjectiveCounterService.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/SubjectiveCounterService-schema.json
+        SERVER s-counter
+        FLAGS isPrivileged
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)"
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/KeepSocket.psi
+    NAME KeepSocket
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Accepts HTTP requests, but never returns a response"
+    SERVICE s-keep-sock
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/KeepSocketService.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/KeepSocketService-schema.json
+        SERVER s-keep-sock
+    PACKAGE_DEPENDS "HttpServer(^${PSIBASE_VERSION}.0)"
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/Loop.psi
+    NAME Loop
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "This is the song that never ends"
+    SERVICE loop
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/Loop.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/Loop-schema.json
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/XProxy.psi
+    NAME XProxy
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Simple reverse proxy"
+    SERVICE x-proxy
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XProxy.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XProxy-schema.json
+        SERVER x-proxy
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/XSocketList.psi
+    NAME XSocketList
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Lists active sockets"
+    SERVICE x-sock-list
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XSocketListService.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XSocketListService-schema.json
+        SERVER x-sock-list
+        FLAGS isPrivileged
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/WSEcho.psi
+    NAME WSEcho
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Accepts websocket connections and echos all messages"
+    SERVICE x-echo
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/WSEcho.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/WSEcho-schema.json
+        SERVER x-echo
+    DEPENDS wasm
+)
+
+psibase_package(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/test-packages/XDelay.psi
+    NAME XDelay
+    VERSION ${PSIBASE_VERSION}.0
+    DESCRIPTION "Test for XTimer"
+    SERVICE x-delay
+        WASM ${CMAKE_CURRENT_BINARY_DIR}/XDelay.wasm
+        SCHEMA ${CMAKE_CURRENT_BINARY_DIR}/XDelay-schema.json
+        SERVER x-delay
+    DEPENDS wasm
+)
+
+write_package_index(test-index ${CMAKE_CURRENT_BINARY_DIR}/test-packages PSubjective Counter AsyncQuery SubjectiveCounter KeepSocket Loop XProxy XSocketList WSEcho XDelay)
+
+ExternalProject_Add(
+    rust
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rust
+    BUILD_BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/rust/release/psibase
+    CONFIGURE_COMMAND ""
+    BUILD_COMMAND   cargo build -r --bin psibase --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/rust/Cargo.toml --target-dir ${CMAKE_CURRENT_BINARY_DIR}/rust
+    BUILD_ALWAYS 1
+    INSTALL_COMMAND ""
+)
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/rust/release/psibase TYPE BIN COMPONENT Client)
 
 option(BUILD_EXAMPLES "Build examples" ON)
 if(BUILD_EXAMPLES)
-    add_subdirectory(doc/psidk/src/cpp-service doc-examples)
+    add_subdirectory(doc/src/development/services/cpp-service doc-examples)
 endif()
+
+include(CPackComponent)
+cpack_add_component_group(Server DESCRIPTION "The psinode server")
+cpack_add_component(ServerBin GROUP Server HIDDEN)
+cpack_add_component(ServerData GROUP Server HIDDEN)
+cpack_add_component(Client DESCRIPTION "The psibase client")
+cpack_add_component_group(SDK DESCRIPTION "SDK for developing psibase services")
+cpack_add_component(Tester GROUP SDK)
+cpack_add_component(WASI GROUP SDK)
+cpack_add_component(libpsibase GROUP SDK)
+
+set(CPACK_PACKAGE_NAME psidk)
+set(CPACK_PACKAGE_VENDOR "Fractally, LLC")
+set(CPACK_PACKAGE_DESCRIPTION)
+set(CPACK_PACKAGE_HOMEPAGE_URL https://about.psibase.io)
+set(CPACK_GENERATOR TGZ)
+include(CPack)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS on)

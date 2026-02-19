@@ -5,7 +5,7 @@
 /// This service adds and multiplies `i32` numbers.
 ///
 /// This is where a detailed description would go.
-#[psibase::service]
+#[psibase::service(name = "example")]
 mod service {
     use psibase::*;
 
@@ -32,7 +32,7 @@ mod service {
     }
 }
 
-#[psibase::test_case(services("test_contract"))]
+#[psibase::test_case(packages("test_contract"))]
 fn test1(chain: psibase::Chain) -> Result<(), psibase::Error> {
     assert_eq!(Wrapper::push(&chain).add(3, 4).get()?, 7);
     assert_eq!(Wrapper::push(&chain).multiply(3, 4).get()?, 12);

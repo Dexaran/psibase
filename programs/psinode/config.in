@@ -2,14 +2,18 @@
 
 p2p      = off
 # producer = psibase
-# sign     = <private key>
-# host     = 127.0.0.1.sslip.io
-port     = 8080
-# peer     = localhost:8080
-service  = localhost:$PREFIX/share/psibase/services/admin-sys
-admin    = static:*
+# key      = <private key>
+host     = psibase.localhost
+host     = psibase.127.0.0.1.sslip.io
+listen   = 8080
+# peer     = http://localhost:8080/
+service  = x-admin.:$PSIBASE_DATADIR/services/x-admin
+database-cache-size = 256MiB
+service-threads = 4
+
+http-timeout = 4s
 
 [logger.stderr]
 type   = console
 filter = Severity >= info
-format = [{TimeStamp}] [{Severity}]{?: [{RemoteEndpoint}]}: {Message}{?: {BlockId}}{?RequestMethod:: {RequestMethod} {RequestHost}{RequestTarget}{?: {ResponseStatus}{?: {ResponseBytes}}}}{?: {ResponseTime} µs}
+format = [{TimeStamp}] [{Severity}]{?: [{RemoteEndpoint}]}: {Message}{?: {TransactionId}}{?: {BlockId}}{?RequestMethod:: {RequestMethod} {RequestHost}{RequestTarget}{?: {ResponseStatus}{?: {ResponseBytes}}}}{?: {ResponseTime} µs}{Indent:4:{TraceConsole}}

@@ -1,12 +1,14 @@
 #include <psibase/ConfigFile.hpp>
 #include <psibase/LogQueue.hpp>
 #include <psibase/log.hpp>
+#include <psibase/trace.hpp>
 
 #include <psio/json/any.hpp>
 #include <psio/to_json.hpp>
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/local/datagram_protocol.hpp>
+#include <boost/asio/write.hpp>
 #include <boost/lexical_cast.hpp>
 #include <boost/log/attributes/current_process_id.hpp>
 #include <boost/log/attributes/current_process_name.hpp>
@@ -15,6 +17,9 @@
 #include <boost/log/sinks/syslog_constants.hpp>
 #include <boost/log/sinks/text_file_backend.hpp>
 #include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/process/child.hpp>
+#include <boost/process/io.hpp>
+#include <boost/process/start_dir.hpp>
 #include <charconv>
 #include <chrono>
 #include <ctime>
@@ -136,6 +141,8 @@ namespace psibase::loggers
                return boost::log::sinks::syslog::warning;
             case level::error:
                return boost::log::sinks::syslog::error;
+            case level::critical:
+               return boost::log::sinks::syslog::critical;
          }
          __builtin_unreachable();
       }
@@ -188,6 +195,11 @@ namespace psibase::loggers
          if (auto attr = boost::log::extract<BlockHeader>("BlockHeader", rec))
          {
             os << ",\"_block_header\":" << psio::convert_to_json(*attr);
+         }
+
+         if (auto attr = boost::log::extract<Checksum256>("TransactionId", rec))
+         {
+            os << ",\"_transaction_id\":" << psio::convert_to_json(*attr);
          }
 
          os << '}';
@@ -246,6 +258,8 @@ namespace psibase::loggers
                case level::error:
                   os << "\"error\"";
                   break;
+               case level::critical:
+                  os << "\"critical\"";
             }
          }
 
@@ -267,6 +281,11 @@ namespace psibase::loggers
          if (auto attr = boost::log::extract<BlockHeader>("BlockHeader", rec))
          {
             os << ",\"BlockHeader\":" << psio::convert_to_json(*attr);
+         }
+
+         if (auto attr = boost::log::extract<Checksum256>("TransactionId", rec))
+         {
+            os << ",\"TransactionId\":" << psio::convert_to_json(*attr);
          }
 
          if (auto attr = boost::log::extract<std::string>("RequestMethod", rec))
@@ -613,7 +632,7 @@ namespace psibase::loggers
       };
 
       boost::log::filter    parse_filter(std::string_view filter);
-      boost::log::formatter parse_formatter(std::string_view formatter);
+      boost::log::formatter parse_formatter(std::string_view formatter, bool in_expansion = false);
 
       bool is_known_channel(std::string_view name)
       {
@@ -633,7 +652,6 @@ namespace psibase::loggers
                                 {
                                    if (key == "format")
                                    {
-                                      std::string tmp;
                                       obj.format = parse_formatter(stream.get_string());
                                    }
                                    else if (key == "filter")
@@ -657,6 +675,7 @@ namespace psibase::loggers
          explicit ConsoleSinkConfig(const sink_args_type& args) {}
          static void init(backend_type& backend)
          {
+            backend.auto_flush(true);
             backend.add_stream(boost::shared_ptr<std::ostream>(&std::clog, [](void*) {}));
          }
          void apply(backend_type& backend) const {}
@@ -1030,14 +1049,14 @@ namespace psibase::loggers
             {
                targetDirectory = log_file_path;
             }
-            auto get_int = [&](std::string_view key) -> std::uintmax_t
+            auto get_int = [&](std::string_view key) -> std::uint64_t
             {
                auto iter = args.find(key);
                if (iter != args.end())
                {
-                  std::uintmax_t result;
-                  const auto&    s   = as_string(iter->second);
-                  auto           err = std::from_chars(s.data(), s.data() + s.size(), result);
+                  std::uint64_t result;
+                  const auto&   s   = as_string(iter->second);
+                  auto          err = std::from_chars(s.data(), s.data() + s.size(), result);
                   if (err.ptr != s.data() + s.size() || err.ec != std::errc())
                   {
                      throw std::runtime_error("Expected an integer");
@@ -1046,7 +1065,7 @@ namespace psibase::loggers
                }
                else
                {
-                  return std::numeric_limits<std::uintmax_t>::max();
+                  return std::numeric_limits<std::uint64_t>::max();
                }
             };
             maxFiles     = get_int("maxFiles");
@@ -1072,6 +1091,7 @@ namespace psibase::loggers
          static void init(backend_type&) {}
          void        apply(boost::log::sinks::text_file_backend& backend) const
          {
+            backend.set_open_mode(std::ios_base::out | std::ios_base::app);
             backend.set_file_name_pattern(filename.native());
             backend.set_target_file_name_pattern(target.native());
             backend.set_rotation_size(rotationSize);
@@ -1123,11 +1143,11 @@ namespace psibase::loggers
          std::filesystem::path          targetDirectory;
          std::filesystem::path          filename;
          std::filesystem::path          target;
-         std::uintmax_t                 maxFiles;
-         std::uintmax_t                 maxSize;
-         std::uintmax_t                 rotationSize;
+         std::uint64_t                  maxFiles;
+         std::uint64_t                  maxSize;
+         std::uint64_t                  rotationSize;
          std::string                    rotationTime;
-         bool                           flush = false;
+         bool                           flush = true;
          std::shared_ptr<time_rotation> rotationTimeFunc;
          bool                           resetCollector = true;
          bool                           needsScan      = true;
@@ -1149,7 +1169,7 @@ namespace psibase::loggers
             stream.write(':');
             psio::to_json(obj.target.native(), stream);
          }
-         if (obj.rotationSize != std::numeric_limits<std::uintmax_t>::max())
+         if (obj.rotationSize != std::numeric_limits<std::uint64_t>::max())
          {
             stream.write(',');
             psio::to_json("rotationSize", stream);
@@ -1163,14 +1183,14 @@ namespace psibase::loggers
             stream.write(':');
             psio::to_json(obj.rotationTime, stream);
          }
-         if (obj.maxFiles != std::numeric_limits<std::uintmax_t>::max())
+         if (obj.maxFiles != std::numeric_limits<std::uint64_t>::max())
          {
             stream.write(',');
             psio::to_json("maxFiles", stream);
             stream.write(':');
             psio::to_json(obj.maxFiles, stream);
          }
-         if (obj.maxSize != std::numeric_limits<std::uintmax_t>::max())
+         if (obj.maxSize != std::numeric_limits<std::uint64_t>::max())
          {
             stream.write(',');
             psio::to_json("maxSize", stream);
@@ -1268,6 +1288,75 @@ namespace psibase::loggers
          psio::to_json(obj.path.native(), stream);
       }
 
+      struct PipeBackend
+          : public boost::log::sinks::
+                basic_formatted_sink_backend<char, boost::log::sinks::synchronized_feeding>
+      {
+         explicit PipeBackend() {}
+         void consume(const boost::log::record_view&, const string_type& message)
+         {
+            pipe << message;
+            pipe.flush();
+         }
+         boost::process::opstream pipe;
+         boost::process::child    active_child;
+      };
+
+      struct PipeSinkConfig
+      {
+         using backend_type = PipeBackend;
+         explicit PipeSinkConfig(const sink_args_type& args)
+         {
+            auto as_string = [](const auto& value) -> const std::string&
+            {
+               if (auto* result = std::get_if<std::string>(&value.value()))
+               {
+                  return *result;
+               }
+               else
+               {
+                  throw std::runtime_error("Expected string");
+               }
+            };
+            auto iter = args.find("command");
+            if (iter == args.end())
+            {
+               throw std::runtime_error("Missing command");
+            }
+            command = as_string(iter->second);
+         }
+         static void init(PipeBackend&) {}
+         void        apply(PipeBackend& backend) const
+         {
+            if (newCommand)
+            {
+               backend.pipe.close();
+               backend.pipe = boost::process::opstream{};
+               if (backend.active_child)
+               {
+                  if (!backend.active_child.wait_for(std::chrono::milliseconds(100)))
+                  {
+                     backend.active_child.terminate();
+                  }
+               }
+               backend.active_child = boost::process::child(
+                   "/bin/sh", "-c", command, boost::process::std_in = backend.pipe,
+                   boost::process::start_dir = log_file_path.native());
+            }
+         }
+         void        setPrevious(PipeSinkConfig&& prev) { newCommand = (prev.command != command); }
+         std::string command;
+         bool        newCommand = true;
+      };
+
+      void to_json(const PipeSinkConfig& obj, auto& stream)
+      {
+         stream.write(',');
+         to_json("command", stream);
+         stream.write(':');
+         to_json(obj.command, stream);
+      }
+
       struct sink_config
       {
          boost::log::formatter format;
@@ -1276,7 +1365,8 @@ namespace psibase::loggers
          std::string           filter_str;
          std::string           type;
          //
-         std::variant<ConsoleSinkConfig, FileSinkConfig, LocalSocketSinkConfig> backend;
+         std::variant<ConsoleSinkConfig, FileSinkConfig, LocalSocketSinkConfig, PipeSinkConfig>
+             backend;
       };
 
       void from_json(sink_config& obj, auto& stream)
@@ -1319,6 +1409,10 @@ namespace psibase::loggers
          if (obj.type == "local")
          {
             obj.backend.emplace<LocalSocketSinkConfig>(args);
+         }
+         if (obj.type == "pipe")
+         {
+            obj.backend.emplace<PipeSinkConfig>(args);
          }
       }
 
@@ -1367,7 +1461,8 @@ namespace psibase::loggers
       boost::shared_ptr<boost::log::sinks::sink> make_sink(const sink_config& cfg)
       {
          return std::visit(
-             [&](auto& backend) {
+             [&](auto& backend)
+             {
                 return static_cast<boost::shared_ptr<boost::log::sinks::sink>>(
                     make_sink(cfg, backend));
              },
@@ -1376,8 +1471,8 @@ namespace psibase::loggers
 
       std::string translate_size(std::string_view s)
       {
-         std::uintmax_t v;
-         auto           err = std::from_chars(s.begin(), s.end(), v);
+         std::uint64_t v;
+         auto          err = std::from_chars(s.begin(), s.end(), v);
          if (err.ec != std::errc())
          {
             throw std::runtime_error("Expected number");
@@ -1530,15 +1625,18 @@ namespace psibase::loggers
           boost::log::filter(boost::log::attribute_name, std::string_view, std::string_view)>;
       using formatter_generator =
           std::function<boost::log::formatter(boost::log::attribute_name, std::string_view)>;
+      using filter_generator_ext =
+          std::function<boost::log::filter(boost::log::attribute_name, std::string_view&)>;
 
       struct filter_parser
       {
-         const char*                                                      begin;
-         const char*                                                      end;
-         std::vector<boost::log::filter>                                  result;
-         std::vector<char>                                                states;
-         bool                                                             not_ = false;
-         static std::map<std::string_view, filter_generator, std::less<>> global_filters;
+         const char*                                                          begin;
+         const char*                                                          end;
+         std::vector<boost::log::filter>                                      result;
+         std::vector<char>                                                    states;
+         bool                                                                 not_ = false;
+         static std::map<std::string_view, filter_generator, std::less<>>     global_filters;
+         static std::map<std::string_view, filter_generator_ext, std::less<>> global_filters_ext;
          bool parse(bool in_format = false)
          {
             while (true)
@@ -1692,6 +1790,23 @@ namespace psibase::loggers
                apply_andor(not_);
             }
          }
+         bool push_ext(std::string_view name)
+         {
+            if (auto iter = global_filters_ext.find(name); iter != global_filters_ext.end())
+            {
+               std::string_view trailing{begin, end};
+               auto f = iter->second(boost::log::attribute_name{std::string(name)}, trailing);
+               assert(trailing.data() + trailing.size() == end);
+               begin = trailing.data();
+               if (not_)
+               {
+                  f = [f = std::move(f)](auto& attrs) mutable { return !f(attrs); };
+               }
+               result.push_back(std::move(f));
+               return true;
+            }
+            return false;
+         }
          bool push_exists(std::string_view name)
          {
             if (global_filters.find(name) != global_filters.end())
@@ -1796,6 +1911,10 @@ namespace psibase::loggers
             parse_ws();
             parse_attribute_name(name);
             parse_ws();
+            if (push_ext(name))
+            {
+               return true;
+            }
             std::string_view op;
             if (parse_operator(op))
             {
@@ -1945,7 +2064,21 @@ namespace psibase::loggers
                {
                   auto name_end = begin;
                   ++begin;
-                  begin = std::find(begin, end, '}');
+                  std::size_t count = 1;
+                  for (; begin != end; ++begin)
+                  {
+                     if (*begin == '}')
+                     {
+                        if (--count == 0)
+                        {
+                           break;
+                        }
+                     }
+                     else if (*begin == '{')
+                     {
+                        ++count;
+                     }
+                  }
                   if (begin == end)
                   {
                      return false;
@@ -2082,6 +2215,8 @@ namespace psibase::loggers
       };
 
       std::map<std::string_view, filter_generator, std::less<>> filter_parser::global_filters;
+      std::map<std::string_view, filter_generator_ext, std::less<>>
+          filter_parser::global_filters_ext;
       std::map<std::string_view,
                std::pair<boost::log::attribute_name, formatter_generator>,
                std::less<>>
@@ -2098,10 +2233,10 @@ namespace psibase::loggers
          return std::move(parser.result[0]);
       }
 
-      boost::log::formatter parse_formatter(std::string_view formatter)
+      boost::log::formatter parse_formatter(std::string_view formatter, bool in_expansion)
       {
          formatter_parser parser{formatter.begin(), formatter.end()};
-         if (!parser.parse())
+         if (!parser.parse(in_expansion))
          {
             throw std::runtime_error("Invalid formatter");
          }
@@ -2198,6 +2333,14 @@ namespace psibase::loggers
       };
 
       template <>
+      auto make_simple_filter_factory<TransactionTrace>()
+      {
+         return [](boost::log::attribute_name name, std::string_view op,
+                   std::string_view value) -> boost::log::filter
+         { throw std::runtime_error(name.string() + " does not support " + std::string(op)); };
+      };
+
+      template <>
       auto make_simple_filter_factory<boost::log::process_id>()
       {
          return [](boost::log::attribute_name name, std::string_view op, std::string_view value)
@@ -2225,6 +2368,12 @@ namespace psibase::loggers
          };
       };
 
+      auto make_alias_filter_factory(boost::log::attribute_name name)
+      {
+         return [name](boost::log::attribute_name /*name*/, std::string_view& trailing)
+         { return [name](const auto& attrs) { return attrs.count(name) != 0; }; };
+      }
+
       template <typename T>
       auto make_simple_formatter_factory()
       {
@@ -2237,6 +2386,35 @@ namespace psibase::loggers
             return [name](auto& rec, auto& stream)
             {
                if (auto attr = boost::log::extract<T>(name, rec))
+               {
+                  stream << *attr;
+               }
+            };
+         };
+      }
+
+      template <>
+      auto make_simple_formatter_factory<level>()
+      {
+         return [](boost::log::attribute_name name, std::string_view spec) -> boost::log::formatter
+         {
+            if (spec == "d")
+            {
+               return [name](auto& rec, auto& stream)
+               {
+                  if (auto attr = boost::log::extract<level>(name, rec))
+                  {
+                     stream << to_syslog(*attr);
+                  }
+               };
+            }
+            else if (!spec.empty() && spec != "s")
+            {
+               throw std::runtime_error("std::format not supported yet");
+            }
+            return [name](auto& rec, auto& stream)
+            {
+               if (auto attr = boost::log::extract<level>(name, rec))
                {
                   stream << *attr;
                }
@@ -2303,6 +2481,25 @@ namespace psibase::loggers
       }
 
       template <>
+      auto make_simple_formatter_factory<TransactionTrace>()
+      {
+         return [](boost::log::attribute_name name, std::string_view spec)
+         {
+            if (!spec.empty())
+            {
+               throw std::runtime_error("Unexpected format spec for " + name.string());
+            }
+            return [name](auto& rec, auto& stream)
+            {
+               if (auto attr = boost::log::extract<TransactionTrace>(name, rec))
+               {
+                  stream << psio::convert_to_json(*attr);
+               }
+            };
+         };
+      }
+
+      template <>
       auto make_simple_formatter_factory<boost::log::process_id>()
       {
          return [](boost::log::attribute_name name, std::string_view spec)
@@ -2350,6 +2547,15 @@ namespace psibase::loggers
              make_simple_formatter_factory<T>());
       }
 
+      // An attribute whose value is derived from another attribute
+      template <typename F>
+      void add_derived_attribute(std::string_view name, std::string_view ref, F&& f)
+      {
+         boost::log::attribute_name attr{std::string(ref)};
+         filter_parser::global_filters_ext.try_emplace(name, make_alias_filter_factory(attr));
+         formatter_parser::global_formatters.try_emplace(name, attr, std::forward<F>(f));
+      }
+
       template <typename F>
       void add_compound_format(std::string_view name, F&& f)
       {
@@ -2357,12 +2563,133 @@ namespace psibase::loggers
                                                          std::forward<F>(f));
       }
 
+      auto make_escape_formatter = [](auto name, std::string_view spec)
+      {
+         auto pos = spec.find(':');
+         if (pos == std::string_view::npos)
+         {
+            throw std::runtime_error("Escape: missing format");
+         }
+         std::string chars{spec.substr(0, pos)};
+         auto        nested = parse_formatter(spec.substr(pos + 1), true);
+         return [chars = std::move(chars), nested = std::move(nested)](
+                    const boost::log::record_view& rec, boost::log::formatting_ostream& os) mutable
+         {
+            std::string data;
+            {
+               boost::log::formatting_ostream nested_os{data};
+               nested(rec, nested_os);
+            }
+            for (auto ch : data)
+            {
+               if (chars.find(ch) != std::string::npos)
+                  os << '\\';
+               os << ch;
+            }
+         };
+      };
+
+      auto make_frame_dec_formatter = [](auto name, std::string_view spec)
+      {
+         auto nested = parse_formatter(spec, true);
+         return [nested = std::move(nested)](const boost::log::record_view&  rec,
+                                             boost::log::formatting_ostream& os) mutable
+         {
+            std::string data;
+            {
+               boost::log::formatting_ostream nested_os{data};
+               nested(rec, nested_os);
+            }
+            os << data.size() << ' ' << data;
+         };
+      };
+
+      auto make_indent_formatter = [](auto name, std::string_view spec)
+      {
+         auto pos = spec.find(':');
+         if (pos == std::string_view::npos)
+         {
+            throw std::runtime_error("Indent: missing format");
+         }
+         unsigned    indent = 0;
+         const char* p      = spec.data();
+         const char* end    = spec.data() + pos;
+         auto        res    = std::from_chars(p, end, indent);
+         if (res.ec != std::errc{} || res.ptr != end)
+            throw std::runtime_error("Indent: invalid width");
+         auto nested = parse_formatter(spec.substr(pos + 1), true);
+         return [indent, nested = std::move(nested)](const boost::log::record_view&  rec,
+                                                     boost::log::formatting_ostream& os) mutable
+         {
+            std::string data;
+            {
+               boost::log::formatting_ostream nested_os{data};
+               nested(rec, nested_os);
+            }
+            if (!data.empty() && !os.str().empty() && !os.str().back() != '\n')
+               os << '\n';
+            bool indenting = true;
+            for (auto ch : data)
+            {
+               if (ch == '\n')
+                  indenting = true;
+               else
+               {
+                  if (indenting)
+                     for (unsigned i = 0; i < indent; ++i)
+                        os << ' ';
+                  indenting = false;
+               }
+               os << ch;
+            }
+            if (!data.empty() && data.back() != '\n')
+               os << '\n';
+         };
+      };
+
+      void print_trace_console(boost::log::formatting_ostream& os, const EventTrace& trace) {}
+      void print_trace_console(boost::log::formatting_ostream& os, const ConsoleTrace& trace)
+      {
+         os << trace.console;
+      }
+      void print_trace_console(boost::log::formatting_ostream& os, const ActionTrace& trace)
+      {
+         for (const auto& inner : trace.innerTraces)
+         {
+            std::visit([&os](const auto& x) { print_trace_console(os, x); }, inner.inner);
+         }
+      }
+
+      auto make_trace_console_formatter = [](auto name, std::string_view spec)
+      {
+         if (!spec.empty())
+         {
+            throw std::runtime_error("No formats defined for TraceConsole");
+         }
+         return
+             [name](const boost::log::record_view& rec, boost::log::formatting_ostream& os) mutable
+         {
+            // possible formats: raw, escaped string, quoted string
+            if (auto attr = boost::log::extract<psibase::TransactionTrace>(name, rec))
+            {
+               for (const auto& action : attr->actionTraces)
+               {
+                  print_trace_console(os, action);
+               }
+            }
+         };
+      };
+
       void do_init()
       {
          auto core = boost::log::core::get();
          core->add_global_attribute(
              "TimeStamp", boost::log::attributes::function<std::chrono::system_clock::time_point>(
                               []() { return std::chrono::system_clock::now(); }));
+
+#ifndef HOST_NAME_MAX
+#define HOST_NAME_MAX 255  // not defined on mac
+#endif
          char hostname[HOST_NAME_MAX + 1];
          if (gethostname(hostname, sizeof(hostname)))
          {
@@ -2379,12 +2706,14 @@ namespace psibase::loggers
          add_attribute<std::chrono::system_clock::time_point>("TimeStamp");
          add_attribute<std::string>("RemoteEndpoint");
          add_attribute<Checksum256>("BlockId");
+         add_attribute<Checksum256>("TransactionId");
          add_attribute<std::string>("Process");
          add_attribute<std::string>("Channel");
          add_attribute<std::string>("Host");
          add_attribute<int>("PeerId");
          add_attribute<boost::log::process_id>("ProcessId");
          add_attribute<BlockHeader>("BlockHeader");
+         add_attribute<TransactionTrace>("Trace");
          add_attribute<std::string>("RequestMethod");
          add_attribute<std::string>("RequestTarget");
          add_attribute<std::string>("RequestHost");
@@ -2396,6 +2725,8 @@ namespace psibase::loggers
          add_attribute<std::chrono::microseconds>("WasmExecTime");
          add_attribute<std::chrono::microseconds>("ResponseTime");
 
+         add_derived_attribute("TraceConsole", "Trace", make_trace_console_formatter);
+
          add_compound_format("Json",
                              [](auto name, std::string_view spec)
                              {
@@ -2406,6 +2737,9 @@ namespace psibase::loggers
                                 return json_formatter;
                              });
          add_compound_format("Syslog", make_syslog_formatter);
+         add_compound_format("Escape", make_escape_formatter);
+         add_compound_format("Indent", make_indent_formatter);
+         add_compound_format("FrameDec", make_frame_dec_formatter);
       }
 
       struct log_config
@@ -2439,6 +2773,10 @@ namespace psibase::loggers
                if (current_config.type == "local")
                {
                   current_config.backend.emplace<LocalSocketSinkConfig>(current_args);
+               }
+               if (current_config.type == "pipe")
+               {
+                  current_config.backend.emplace<PipeSinkConfig>(current_args);
                }
                auto sink = make_sink(current_config);
                sinks.try_emplace(std::string(current_name), std::move(current_config), sink);
@@ -2631,6 +2969,8 @@ namespace psibase::loggers
       {
          obj.impl.reset(new Config::Impl);
       }
+      // Ensure that the format and filter parsers are initialized
+      log_config::instance();
       from_json_object(stream,
                        [&](std::string_view key)
                        {
@@ -2686,7 +3026,7 @@ namespace psibase::loggers
       {
          file.set(section, "target", obj.target.native(), "The pattern for rotated log files");
       }
-      if (obj.rotationSize != std::numeric_limits<std::uintmax_t>::max())
+      if (obj.rotationSize != std::numeric_limits<std::uint64_t>::max())
       {
          file.set(section, "rotationSize", std::to_string(obj.rotationSize),
                   "Rotate logs when they reach this size");
@@ -2695,12 +3035,12 @@ namespace psibase::loggers
       {
          file.set(section, "rotationTime", obj.rotationTime, "Time when logs are rotated");
       }
-      if (obj.maxFiles != std::numeric_limits<std::uintmax_t>::max())
+      if (obj.maxFiles != std::numeric_limits<std::uint64_t>::max())
       {
          file.set(section, "maxFiles", std::to_string(obj.maxFiles),
                   "Maximum number of log files retained");
       }
-      if (obj.maxSize != std::numeric_limits<std::uintmax_t>::max())
+      if (obj.maxSize != std::numeric_limits<std::uint64_t>::max())
       {
          file.set(section, "maxSize", std::to_string(obj.maxSize),
                   "Maximum total size of log files retained");
@@ -2713,6 +3053,11 @@ namespace psibase::loggers
                        ConfigFile&                  file)
    {
       file.set(section, "path", obj.path.native(), "");
+   }
+
+   void to_config_impl(const std::string& section, const PipeSinkConfig& obj, ConfigFile& file)
+   {
+      file.set(section, "command", obj.command, "");
    }
 
    void to_config(const Config& obj, ConfigFile& file)
@@ -2749,6 +3094,9 @@ namespace psibase::loggers
          case level::error:
             os << "error";
             break;
+         case level::critical:
+            os << "critical";
+            break;
       }
       return os;
    }
@@ -2776,6 +3124,10 @@ namespace psibase::loggers
          else if (s == "error")
          {
             l = level::error;
+         }
+         else if (s == "critical")
+         {
+            l = level::critical;
          }
          else
          {

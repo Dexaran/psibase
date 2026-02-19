@@ -1,75 +1,74 @@
 {
-    "version": "2.0.0",
-    "inputs": [
-        {
-            "id": "testsuite",
-            "type": "promptString",
-            "default": "[mytestsuite]",
-            "description": "Enter test suite key (Example: \"[MyTestSuite]\""
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build",
+      "type": "shell",
+      "command": ".vscode/scripts/build.sh",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "options": {
+        "statusbar": {
+          "label": "$(tools) Build"
         }
-    ],
-    "tasks": [
-        // Compilation
-        {
-            "label": "buildcpp",
-            "type": "shell",
-            "command": "cd build && cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_DEBUG_WASM=ON -DBUILD_RUST=yes -DBUILD_DOC=no -DBUILD_JS=no -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache .. && make -j $(nproc)",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "options": {
-                "statusbar": {
-                    "label": "$(diff-insert) Build services",
-                    "tooltip": "Build cpp/rust only"
-                }
-            }
-        },
-        {
-            "label": "make",
-            "type": "shell",
-            "command": "cd build && cmake -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=Release -DBUILD_DEBUG_WASM=ON -DBUILD_RUST=yes -DBUILD_DOC=yes -DBUILD_JS=yes -DBUILD_NATIVE=yes -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache .. && make -j $(nproc)",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "options": {
-                "statusbar": {
-                    "label": "$(diff-insert) Full Build",
-                    "tooltip": "Build with cmake"
-                }
-            }
-        },
-        {
-            "label": "testnet",
-            "type": "shell",
-            "command": "cd build && cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_DEBUG_WASM=ON -DBUILD_RUST=yes -DBUILD_DOC=yes -DBUILD_JS=yes -DBUILD_NATIVE=yes -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache .. && make -j $(nproc) && ./psitest launchTestChain-test-debug.wasm -s -r compact",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "options": {
-                "statusbar": {
-                    "label": "$(diff-insert) Build & Launch local testnet",
-                    "tooltip": "Build with cmake & invoke psitest on the testchain wasm"
-                }
-            }
-        },
-        {
-            "label": "testspecific",
-            "type": "shell",
-            "command": "cd build && ./psitest TokenSys-test-debug.wasm -s -r compact",
-            "args": [],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "options": {
-                "statusbar": {
-                    "label": "$(diff-insert) Test Token",
-                    "tooltip": "Invoke psitest on the system token service"
-                }
-            }
+      }
+    },
+    {
+      "label": "Continue",
+      "type": "shell",
+      "command": ".vscode/scripts/continue.sh $HOST_IP myprod 8080",
+      "options": {
+        "statusbar": {
+          "label": "$(play) Continue"
         }
-    ]
+      }
+    },
+    {
+      "label": "Launch",
+      "type": "shell",
+      "command": ".vscode/scripts/launch.sh $HOST_IP myprod 8080",
+      "options": {
+        "statusbar": {
+          "label": "$(play) Launch"
+        }
+      }
+    },
+    {
+      "label": "Launch Secure",
+      "type": "shell",
+      "command": ".vscode/scripts/launch_secure.sh $HOST_IP myprod 8080 /usr/lib/softhsm/libsofthsm2.so",
+      "options": {
+        "statusbar": {
+          "label": "$(play)$(lock) Launch Secure"
+        }
+      }
+    }
+
+    // Keeping the below example to show how to run service unit tests:
+    // Use `psitest -v -v` for more verbose output
+    // {
+    //     "label": "Test NFT",
+    //     "type": "shell",
+    //     "command": "cd build && psitest Nft-test-debug.wasm -s -r compact",
+    //     "group": {
+    //         "kind": "test",
+    //         "isDefault": false
+    //     },
+    //     "options": {
+    //         "statusbar": {
+    //             "label": "$(beaker) Test Nft"
+    //         }
+    //     }
+    // },
+  ],
+  "inputs": [
+    {
+      "id": "testsuite",
+      "type": "promptString",
+      "default": "[mytestsuite]",
+      "description": "Enter test suite key (Example: \"[MyTestSuite]\""
+    }
+  ]
 }

@@ -165,7 +165,8 @@ namespace psio
             varuint64_from_bin(size, stream);
             stream.check_available(size * sizeof(T));
             v.resize(size);
-            stream.read(reinterpret_cast<char*>(v.data()), size * sizeof(T));
+            if (size)
+               stream.read(reinterpret_cast<char*>(v.data()), size * sizeof(T));
          }
          else
          {
@@ -173,7 +174,8 @@ namespace psio
             varuint32_from_bin(size, stream);
             stream.check_available(size * sizeof(T));
             v.resize(size);
-            stream.read(reinterpret_cast<char*>(v.data()), size * sizeof(T));
+            if (size)
+               stream.read(reinterpret_cast<char*>(v.data()), size * sizeof(T));
          }
       }
       else
@@ -342,15 +344,8 @@ namespace psio
       }
       else
       {
-         reflect<T>::for_each(
-             [&](const psio::meta&, auto member)
-             {
-                if constexpr (not std::is_member_function_pointer_v<decltype(member(
-                                  std::declval<T*>()))>)
-                {
-                   from_bin(obj.*member(&obj), stream);
-                }
-             });
+         psio::apply_members((typename reflect<T>::data_members*)nullptr,
+                             [&](auto... member) { (from_bin(obj.*member, stream), ...); });
       }
    }
 

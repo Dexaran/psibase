@@ -6,14 +6,27 @@
 //!
 //! These functions and types wrap the [Raw Native Functions](crate::tester_raw).
 
+#![cfg_attr(not(target_family = "wasm"), allow(unused_imports, dead_code))]
+
 use crate::{
-    kv_get, services, status_key, tester_raw, AccountNumber, Action, Caller, InnerTraceEnum,
-    Reflect, SignedTransaction, StatusRow, TimePointSec, Transaction, TransactionTrace,
+    actions::login_action, check, create_boot_transactions, get_optional_result_bytes,
+    get_result_bytes, services, status_key, tester_raw, AccountNumber, Action, BlockTime, Caller,
+    Checksum256, CodeByHashRow, CodeRow, DbId, DirectoryRegistry, Error, HostConfigRow, HttpBody,
+    HttpHeader, HttpReply, HttpRequest, InnerTraceEnum, PackageRegistry, RunMode, Seconds,
+    SignedTransaction, StatusRow, Tapos, TimePointSec, TimePointUSec, ToKey, Transaction,
+    TransactionTrace,
 };
+#[cfg(target_family = "wasm")]
+use crate::{MicroSeconds, PackageList, PackageOp};
 use anyhow::anyhow;
-use fracpack::{Pack, Unpack};
+use chrono::Utc;
+use fracpack::{Pack, Unpack, UnpackOwned};
+use futures::executor::block_on;
 use psibase_macros::account_raw;
+use serde::{de::DeserializeOwned, Deserialize};
+use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::{marker::PhantomData, ptr::null_mut};
 
 /// Execute a shell command
@@ -23,43 +36,16 @@ pub fn execute(command: &str) -> i32 {
     unsafe { tester_raw::testerExecute(command.as_ptr(), command.len()) }
 }
 
-/// Read a file into memory. Returns `None` if failure.
-pub fn read_whole_file(filename: &str) -> Option<Vec<u8>> {
-    struct Context {
-        size: usize,
-        bytes: Vec<u8>,
-    }
-    let mut context = Context {
-        size: 0,
-        bytes: Vec::new(),
-    };
-    unsafe {
-        unsafe extern "C" fn alloc(alloc_context: *mut u8, size: usize) -> *mut u8 {
-            let context = &mut *(alloc_context as *mut Context);
-            context.size = size;
-            context.bytes.reserve(size);
-            context.bytes.as_mut_ptr()
-        }
-        if !tester_raw::testerReadWholeFile(
-            filename.as_ptr(),
-            filename.len(),
-            (&mut context) as *mut Context as *mut u8,
-            alloc,
-        ) {
-            return None;
-        }
-        context.bytes.set_len(context.size);
-        Some(context.bytes)
-    }
-}
-
 /// Block chain under test
 #[derive(Debug)]
 pub struct Chain {
     chain_handle: u32,
     status: RefCell<Option<StatusRow>>,
     producing: Cell<bool>,
+    is_auto_block_start: bool,
 }
+
+pub const PRODUCER_ACCOUNT: AccountNumber = AccountNumber::new(account_raw!("prod"));
 
 impl Default for Chain {
     fn default() -> Self {
@@ -69,61 +55,301 @@ impl Default for Chain {
 
 impl Drop for Chain {
     fn drop(&mut self) {
-        unsafe { tester_raw::testerDestroyChain(self.chain_handle) }
+        unsafe { tester_raw::destroyChain(self.chain_handle) }
+        tester_raw::tester_clear_chain_for_db(self.chain_handle)
     }
 }
 
+// Following are stub functions for the linter (running in a non-wasm environment)
+// can see that these functions exist; otherwise, tests show linter errors for valid calls.
+#[cfg(not(target_family = "wasm"))]
+impl Chain {
+    pub fn new() -> Chain {
+        unimplemented!();
+    }
+    pub fn push(&self, _transaction: &SignedTransaction) -> TransactionTrace {
+        unimplemented!();
+    }
+    pub fn start_block(&self) {
+        unimplemented!();
+    }
+}
+
+#[cfg(target_family = "wasm")]
 impl Chain {
     /// Create a new chain and make it active for database native functions.
     ///
-    /// Shortcut for `Tester::create(1_000_000_000, 32, 32, 32, 38)`
+    /// Shortcut for `Tester::create(1 << 27, 1 << 27, 1 << 27, 1 << 27)`
     pub fn new() -> Chain {
-        Self::create(1_000_000_000, 32, 32, 32, 38)
+        Self::create(1 << 27, 1 << 27, 1 << 27, 1 << 27)
+    }
+
+    /// Boot the tester chain with default services being deployed
+    pub fn boot(&self) -> Result<(), Error> {
+        let default_services: Vec<String> = vec!["TestDefault".to_string()];
+        self.boot_with(&Self::default_registry(), &default_services[..])
+    }
+
+    pub fn default_registry() -> DirectoryRegistry {
+        let psibase_data_dir = std::env::var("PSIBASE_DATADIR")
+            .expect("Cannot find package directory: PSIBASE_DATADIR not defined");
+        let packages_dir = Path::new(&psibase_data_dir).join("packages");
+        DirectoryRegistry::new(packages_dir)
+    }
+
+    pub fn boot_with<R: PackageRegistry>(&self, reg: &R, services: &[String]) -> Result<(), Error> {
+        let mut services = block_on(reg.resolve(services))?;
+
+        const COMPRESSION_LEVEL: u32 = 4;
+        let (boot_tx, subsequent_tx) = create_boot_transactions(
+            &None,
+            &None,
+            PRODUCER_ACCOUNT,
+            false,
+            TimePointSec { seconds: 10 },
+            &mut services[..],
+            COMPRESSION_LEVEL,
+        )
+        .unwrap();
+
+        for trx in boot_tx {
+            self.push(&trx).ok()?;
+        }
+
+        self.start_block();
+
+        for (_, group, _) in subsequent_tx {
+            for trx in group {
+                self.push(&trx).ok()?;
+            }
+        }
+
+        self.start_block();
+
+        Ok(())
     }
 
     /// Create a new chain and make it active for database native functions.
     ///
-    /// `max_objects` is the maximum number of objects the database can hold.
-    /// The remaining arguments are log-base-2 of file sizes for the database's
-    /// various files. e.g. `32` is 4 GB.
-    pub fn create(
-        max_objects: u64,
-        hot_addr_bits: u64,
-        warm_addr_bits: u64,
-        cool_addr_bits: u64,
-        cold_addr_bits: u64,
-    ) -> Chain {
+    /// The arguments are the file sizes in bytes for the database's
+    /// various files.
+    pub fn create(hot_bytes: u64, warm_bytes: u64, cool_bytes: u64, cold_bytes: u64) -> Chain {
+        println!("TESTER CREATE");
+        let chain_handle =
+            unsafe { tester_raw::createChain(hot_bytes, warm_bytes, cool_bytes, cold_bytes) };
+        if chain_handle == 0 {
+            tester_raw::tester_select_chain_for_db(chain_handle)
+        }
+        let mut result = Chain {
+            chain_handle,
+            status: None.into(),
+            producing: false.into(),
+            is_auto_block_start: true,
+        };
+        result.load_local_services();
+        result.start_session();
+        result
+    }
+
+    fn load_local_services(&mut self) {
+        use crate::{CODE_TABLE, NATIVE_TABLE_PRIMARY_INDEX};
+        let prefix = (CODE_TABLE, NATIVE_TABLE_PRIMARY_INDEX).to_key();
+        if unsafe {
+            tester_raw::kvGreaterEqual(
+                self.chain_handle,
+                DbId::NativeSubjective,
+                prefix.as_ptr(),
+                prefix.len() as u32,
+                prefix.len() as u32,
+            )
+        } != u32::MAX
+        {
+            return;
+        }
+
+        let packages_root: PathBuf = std::env::var_os("PSIBASE_DATADIR")
+            .expect("Cannot find local service directory")
+            .into();
+        let packages_dir = packages_root.join("packages");
+        let registry = DirectoryRegistry::new(packages_dir);
+        let package_names = vec!["XDefault".to_string()];
+        let packages =
+            block_on(PackageList::new().resolve_changes(&registry, &package_names, false, true))
+                .unwrap();
+        let mut requests = Vec::new();
         unsafe {
-            Chain {
-                chain_handle: tester_raw::testerCreateChain(
-                    max_objects,
-                    hot_addr_bits,
-                    warm_addr_bits,
-                    cool_addr_bits,
-                    cold_addr_bits,
-                ),
-                status: None.into(),
-                producing: false.into(),
+            tester_raw::checkoutSubjective(self.chain_handle);
+        }
+        for op in packages {
+            let PackageOp::Install(info) = op else {
+                panic!("Only install is expected when there are no existing packages")
+            };
+            let mut package = block_on(registry.get_by_info(&info)).unwrap();
+            for (account, info, code) in package.services() {
+                let hash: [u8; 32] = Sha256::digest(&code).into();
+                let code_hash: Checksum256 = hash.into();
+
+                let code_row = CodeRow {
+                    codeNum: *account,
+                    flags: info.parse_flags(),
+                    codeHash: code_hash.clone(),
+                    vmType: 0,
+                    vmVersion: 0,
+                };
+                let key = code_row.key();
+                self.kv_put(DbId::NativeSubjective, &key, &code_row);
+                let code_by_hash_row = CodeByHashRow {
+                    codeHash: code_hash,
+                    vmType: 0,
+                    vmVersion: 0,
+                    code: code.into(),
+                };
+                let key = code_by_hash_row.key();
+                self.kv_put(DbId::NativeSubjective, &key, &code_by_hash_row);
+            }
+
+            let root_host = "\0";
+
+            for (account, path, file) in package.data() {
+                let Some(mime_type) = mime_guess::from_path(&path).first() else {
+                    panic!("Cannot determine Mime-Type for {}", path)
+                };
+                requests.push(HttpRequest {
+                    host: account.to_string() + "." + root_host,
+                    method: "PUT".to_string(),
+                    target: path,
+                    contentType: mime_type.to_string(),
+                    headers: Vec::new(),
+                    body: file.into(),
+                });
+            }
+            requests.push(HttpRequest {
+                host: services::x_packages::SERVICE.to_string() + "." + root_host,
+                method: "PUT".to_string(),
+                target: format!("/manifest/{}", info.sha256),
+                contentType: "application/json".to_string(),
+                headers: vec![],
+                body: serde_json::to_string(&package.manifest())
+                    .unwrap()
+                    .into_bytes()
+                    .into(),
+            });
+            requests.push(HttpRequest {
+                host: services::x_packages::SERVICE.to_string() + "." + root_host,
+                method: "POST".to_string(),
+                target: "/postinstall".to_string(),
+                contentType: "application/json".to_string(),
+                headers: vec![],
+                body: serde_json::to_string(&info).unwrap().into_bytes().into(),
+            });
+        }
+        check(
+            unsafe { tester_raw::commitSubjective(self.chain_handle) },
+            "Failed to commit changes",
+        );
+        for request in requests {
+            let reply = self.http(&request).unwrap();
+            if reply.status != 200 {
+                panic!("PUT failed: {}", reply.text().unwrap());
             }
         }
+    }
+
+    fn start_session(&mut self) {
+        let row = HostConfigRow {
+            hostVersion: format!("psitest-{}", env!("CARGO_PKG_VERSION")),
+            config: r#"{"host":{"hosts":["psibase.io"]}}"#.to_string(),
+        };
+
+        unsafe {
+            tester_raw::checkoutSubjective(self.chain_handle);
+        }
+        self.kv_put(DbId::NativeSession, &row.key(), &row);
+        check(
+            unsafe { tester_raw::commitSubjective(self.chain_handle) },
+            "Failed to commit changes",
+        );
+        let trace = self.run_action(
+            RunMode::RPC,
+            true,
+            services::x_http::Wrapper::pack_from(AccountNumber::default()).startSession(),
+        );
+        ChainEmptyResult { trace }.get().unwrap()
+    }
+
+    /// Advance the blockchain time by the specified number of microseconds and start a new block.
+    ///
+    /// This method increments the current block time by `seconds` and starts a new block at that time.
+    /// If no current block exists, it starts from a default time (e.g., 0 microseconds).
+    pub fn start_block_after(&self, micro_seconds: MicroSeconds) {
+        // Scope the immutable borrow to ensure it’s dropped before calling start_block_at
+        let current_time = {
+            let status = self.status.borrow();
+            status
+                .as_ref()
+                .map(|s| s.current.time)
+                .unwrap_or(TimePointUSec { microseconds: 0 })
+        };
+        self.start_block_at(current_time + micro_seconds);
     }
 
     /// Start a new block
     ///
     /// Starts a new block at `time`. If `time.seconds` is 0,
     /// then starts a new block 1 second after the most recent.
-    ///
-    /// TODO: Support sub-second block times
-    pub fn start_block_at(&self, time: TimePointSec) {
+    pub fn start_block_at(&self, time: BlockTime) {
         let status = &mut *self.status.borrow_mut();
+
+        let (producer, term, mut commit_num) = if let Some(status) = status {
+            let producers = if let Some(next) = &status.consensus.next {
+                if status.current.commitNum < next.blockNum {
+                    status.consensus.current.data.producers()
+                } else {
+                    next.consensus.data.producers()
+                }
+            } else {
+                status.consensus.current.data.producers()
+            };
+            (
+                if producers.is_empty() {
+                    AccountNumber::from("firstproducer")
+                } else {
+                    producers[0].name
+                },
+                status.current.term,
+                status.head.as_ref().map_or(0, |head| head.header.blockNum),
+            )
+        } else {
+            (AccountNumber::from("firstproducer"), 0, 0)
+        };
+
         // Guarantee that there is a recent block for fillTapos to use.
         if let Some(status) = status {
-            if status.current.time.seconds + 1 < time.seconds {
-                unsafe { tester_raw::testerStartBlock(self.chain_handle, time.seconds - 1) }
+            if status.current.time + Seconds::new(1) < time {
+                unsafe {
+                    tester_raw::startBlock(
+                        self.chain_handle,
+                        (time - Seconds::new(1)).microseconds,
+                        producer.value,
+                        term,
+                        commit_num,
+                    )
+                }
+                commit_num += 1;
             }
         }
-        unsafe { tester_raw::testerStartBlock(self.chain_handle, time.seconds) }
-        *status = kv_get::<StatusRow, _>(StatusRow::DB, &status_key()).unwrap();
+        unsafe {
+            tester_raw::startBlock(
+                self.chain_handle,
+                time.microseconds,
+                producer.value,
+                term,
+                commit_num,
+            )
+        }
+        *status = self
+            .kv_get::<StatusRow, _>(StatusRow::DB, &status_key())
+            .unwrap();
         self.producing.replace(true);
     }
 
@@ -131,33 +357,22 @@ impl Chain {
     ///
     /// Starts a new block 1 second after the most recent.
     pub fn start_block(&self) {
-        self.start_block_at(TimePointSec { seconds: 0 })
+        self.start_block_after(Seconds::new(1).into())
     }
 
     /// Finish a block
     ///
     /// This does nothing if a block isn't currently being produced.
     pub fn finish_block(&self) {
-        unsafe { tester_raw::testerFinishBlock(self.chain_handle) }
+        unsafe { tester_raw::finishBlock(self.chain_handle) }
         self.producing.replace(false);
     }
 
-    /// Fill tapos fields
-    ///
-    /// `expire_seconds` is relative to the most-recent block.
-    pub fn fill_tapos(&self, trx: &mut Transaction, expire_seconds: u32) {
-        trx.tapos.expiration.seconds = expire_seconds;
-        trx.tapos.refBlockIndex = 0;
-        trx.tapos.refBlockSuffix = 0;
-        if let Some(status) = &*self.status.borrow() {
-            trx.tapos.expiration.seconds = status.current.time.seconds + expire_seconds;
-            if let Some(head) = &status.head {
-                let mut suffix = [0; 4];
-                suffix.copy_from_slice(&head.blockId[head.blockId.len() - 4..]);
-                trx.tapos.refBlockIndex = (head.header.blockNum & 0x7f) as u8;
-                trx.tapos.refBlockSuffix = u32::from_le_bytes(suffix);
-            }
-        }
+    /// By default, the TestChain will automatically advance blocks.
+    /// When disabled, the the chain will only advance blocks manually.
+    /// To manually advance a block, call start_block.
+    pub fn set_auto_block_start(&mut self, enable: bool) {
+        self.is_auto_block_start = enable;
     }
 
     /// Push a transaction
@@ -170,31 +385,18 @@ impl Chain {
         }
 
         let transaction = transaction.packed();
-        struct Context {
-            size: usize,
-            bytes: Vec<u8>,
-        }
-        let mut context = Context {
-            size: 0,
-            bytes: Vec::new(),
+        let size = unsafe {
+            tester_raw::pushTransaction(self.chain_handle, transaction.as_ptr(), transaction.len())
         };
-        unsafe {
-            unsafe extern "C" fn alloc(alloc_context: *mut u8, size: usize) -> *mut u8 {
-                let context = &mut *(alloc_context as *mut Context);
-                context.size = size;
-                context.bytes.reserve(size);
-                context.bytes.as_mut_ptr()
-            }
-            tester_raw::testerPushTransaction(
-                self.chain_handle,
-                transaction.as_ptr(),
-                transaction.len(),
-                (&mut context) as *mut Context as *mut u8,
-                alloc,
-            );
-            context.bytes.set_len(context.size);
-            TransactionTrace::unpacked(&context.bytes).unwrap()
-        }
+        TransactionTrace::unpacked(&get_result_bytes(size)).unwrap()
+    }
+
+    pub fn run_action(&mut self, mode: RunMode, head: bool, action: Action) -> TransactionTrace {
+        let packed = action.packed();
+        let size = unsafe {
+            tester_raw::runAction(self.chain_handle, mode, head, packed.as_ptr(), packed.len())
+        };
+        TransactionTrace::unpacked(&get_result_bytes(size)).unwrap()
     }
 
     /// Copy database to `path`
@@ -219,9 +421,9 @@ impl Chain {
     /// will corrupt the database and likely crash the `psitest` process running this
     /// wasm.
     pub unsafe fn get_path(&self) -> String {
-        let size = tester_raw::testerGetChainPath(self.chain_handle, null_mut(), 0);
+        let size = tester_raw::getChainPath(self.chain_handle, null_mut(), 0);
         let mut bytes = Vec::with_capacity(size);
-        tester_raw::testerGetChainPath(self.chain_handle, bytes.as_mut_ptr(), size);
+        tester_raw::getChainPath(self.chain_handle, bytes.as_mut_ptr(), size);
         bytes.set_len(size);
         String::from_utf8_unchecked(bytes)
     }
@@ -237,20 +439,57 @@ impl Chain {
     /// * [`native_raw::kvLessThan`](crate::native_raw::kvLessThan)
     /// * [`native_raw::kvMax`](crate::native_raw::kvMax)
     pub fn select_chain(&self) {
-        unsafe { tester_raw::testerSelectChainForDb(self.chain_handle) }
+        tester_raw::tester_select_chain_for_db(self.chain_handle)
+    }
+
+    pub fn kv_get_bytes(&self, db: DbId, key: &[u8]) -> Option<Vec<u8>> {
+        let size =
+            unsafe { tester_raw::kvGet(self.chain_handle, db, key.as_ptr(), key.len() as u32) };
+        get_optional_result_bytes(size)
+    }
+
+    pub fn kv_get<V: UnpackOwned, K: ToKey>(
+        &self,
+        db: DbId,
+        key: &K,
+    ) -> Result<Option<V>, fracpack::Error> {
+        if let Some(v) = self.kv_get_bytes(db, &key.to_key()) {
+            Ok(Some(V::unpacked(&v)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set a key-value pair
+    ///
+    /// If key already exists, then replace the existing value.
+    pub fn kv_put_bytes(&mut self, db: DbId, key: &[u8], value: &[u8]) {
+        unsafe {
+            tester_raw::kvPut(
+                self.chain_handle,
+                db,
+                key.as_ptr(),
+                key.len() as u32,
+                value.as_ptr(),
+                value.len() as u32,
+            )
+        }
+    }
+
+    /// Set a key-value pair
+    ///
+    /// If key already exists, then replace the existing value.
+    pub fn kv_put<K: ToKey, V: Pack>(&mut self, db: DbId, key: &K, value: &V) {
+        self.kv_put_bytes(db, &key.to_key(), &value.packed())
     }
 
     /// Create a new account
     ///
-    /// Create a new account which authenticates using `auth-any-sys`.
+    /// Create a new account which authenticates using `auth-any`.
     /// Doesn't fail if the account already exists.
     pub fn new_account(&self, account: AccountNumber) -> Result<(), anyhow::Error> {
-        services::account_sys::Wrapper::push(self)
-            .newAccount(
-                account,
-                AccountNumber::new(account_raw!("auth-any-sys")),
-                false,
-            )
+        services::accounts::Wrapper::push(self)
+            .newAccount(account, AccountNumber::new(account_raw!("auth-any")), false)
             .get()
     }
 
@@ -259,10 +498,170 @@ impl Chain {
     /// Set code on an account. Also creates the account if needed.
     pub fn deploy_service(&self, account: AccountNumber, code: &[u8]) -> Result<(), anyhow::Error> {
         self.new_account(account)?;
-        // TODO: update setcode_sys::setCode to not need a vec. Needs changes to the service macro.
-        services::setcode_sys::Wrapper::push_from(self, account)
+        // TODO: update setcode::setCode to not need a vec. Needs changes to the service macro.
+        services::setcode::Wrapper::push_from(self, account)
             .setCode(account, 0, 0, code.to_vec().into())
             .get()
+    }
+
+    pub fn http(&self, request: &HttpRequest) -> Result<HttpReply, anyhow::Error> {
+        let packed_request = request.packed();
+        let fd = unsafe {
+            tester_raw::httpRequest(
+                self.chain_handle,
+                packed_request.as_ptr(),
+                packed_request.len(),
+            )
+        };
+        let mut size: u32 = 0;
+        let err = unsafe { tester_raw::socketRecv(fd, &mut size) };
+        if err != 0 {
+            Err(anyhow!("Could not read response: {}", err))?;
+        }
+
+        Ok(HttpReply::unpacked(&get_result_bytes(size))?)
+    }
+
+    pub fn get(&self, account: AccountNumber, target: &str) -> Result<HttpReply, anyhow::Error> {
+        self.get_auth(account, target, "")
+    }
+
+    pub fn post(
+        &self,
+        account: AccountNumber,
+        target: &str,
+        data: HttpBody,
+    ) -> Result<HttpReply, anyhow::Error> {
+        self.post_auth(account, target, data, "")
+    }
+
+    pub fn graphql<T: DeserializeOwned>(
+        &self,
+        account: AccountNumber,
+        query: &str,
+    ) -> Result<T, anyhow::Error> {
+        self.graphql_auth(account, query, "")
+    }
+
+    pub fn get_auth(
+        &self,
+        account: AccountNumber,
+        target: &str,
+        token: &str,
+    ) -> Result<HttpReply, anyhow::Error> {
+        let mut headers = Vec::new();
+        if !token.is_empty() {
+            headers.push(HttpHeader::new(
+                "Authorization",
+                &format!("Bearer {}", token),
+            ));
+        }
+        self.http(&HttpRequest {
+            host: format!("{}.psibase.io", account),
+            method: "GET".into(),
+            target: target.into(),
+            contentType: "".into(),
+            body: <Vec<u8>>::new().into(),
+            headers,
+        })
+    }
+
+    pub fn post_auth(
+        &self,
+        account: AccountNumber,
+        target: &str,
+        data: HttpBody,
+        token: &str,
+    ) -> Result<HttpReply, anyhow::Error> {
+        let mut headers = Vec::new();
+        if !token.is_empty() {
+            headers.push(HttpHeader::new(
+                "Authorization",
+                &format!("Bearer {}", token),
+            ));
+        }
+        self.http(&HttpRequest {
+            host: format!("{}.psibase.io", account),
+            method: "POST".into(),
+            target: target.into(),
+            contentType: data.contentType,
+            body: data.body,
+            headers,
+        })
+    }
+
+    pub fn graphql_auth<T: DeserializeOwned>(
+        &self,
+        account: AccountNumber,
+        query: &str,
+        token: &str,
+    ) -> Result<T, anyhow::Error> {
+        self.post_auth(account, "/graphql", HttpBody::graphql(query), token)?
+            .json()
+    }
+
+    pub fn login(
+        &self,
+        user: AccountNumber,
+        service: AccountNumber,
+    ) -> Result<String, anyhow::Error> {
+        let expiration = TimePointSec::from(Utc::now()) + Seconds::new(10);
+
+        let tapos = Tapos {
+            expiration,
+            refBlockSuffix: 0,
+            flags: Tapos::DO_NOT_BROADCAST_FLAG,
+            refBlockIndex: 0,
+        };
+
+        let trx = Transaction {
+            tapos,
+            actions: vec![login_action(user, service, "psibase.io")],
+            claims: vec![],
+        };
+
+        let strx = SignedTransaction {
+            transaction: trx.packed().into(),
+            proofs: vec![],
+        };
+
+        let reply = self.post(
+            services::transact::SERVICE,
+            "/login",
+            HttpBody {
+                contentType: "application/octet-stream".into(),
+                body: strx.packed().into(),
+            },
+        )?;
+
+        #[derive(Deserialize)]
+        struct LoginReply {
+            access_token: String,
+        }
+
+        let login_reply: LoginReply = reply.json()?;
+        Ok(login_reply.access_token)
+    }
+}
+
+impl Chain {
+    /// Fill tapos fields
+    ///
+    /// `expire_seconds` is relative to the most-recent block.
+    pub fn fill_tapos(&self, trx: &mut Transaction, expire_seconds: u32) {
+        trx.tapos.expiration.seconds = expire_seconds as i64;
+        trx.tapos.refBlockIndex = 0;
+        trx.tapos.refBlockSuffix = 0;
+        if let Some(status) = &*self.status.borrow() {
+            trx.tapos.expiration =
+                status.current.time.seconds() + Seconds::new(expire_seconds as i64);
+            if let Some(head) = &status.head {
+                let mut suffix = [0; 4];
+                suffix.copy_from_slice(&head.blockId[head.blockId.len() - 4..]);
+                trx.tapos.refBlockIndex = (head.header.blockNum & 0x7f) as u8;
+                trx.tapos.refBlockSuffix = u32::from_le_bytes(suffix);
+            }
+        }
     }
 }
 
@@ -291,23 +690,57 @@ pub struct ChainResult<T: fracpack::UnpackOwned> {
 
 impl<T: fracpack::UnpackOwned> ChainResult<T> {
     pub fn get(&self) -> Result<T, anyhow::Error> {
+        self.get_with_debug(false)
+    }
+
+    fn is_user_action(act: &Action) -> bool {
+        use crate::{
+            self as psibase, method,
+            services::{cpu_limit, db, events, transact, virtual_server},
+        };
+        !(act.service == db::SERVICE && act.method == method!("open")
+            || act.service == cpu_limit::SERVICE
+            || act.sender == transact::SERVICE && act.service == virtual_server::SERVICE
+            || act.service == events::SERVICE && act.method == method!("sync")
+            || act.sender == AccountNumber::default())
+    }
+
+    pub fn get_with_debug(&self, debug: bool) -> Result<T, anyhow::Error> {
         if let Some(e) = &self.trace.error {
             return Err(anyhow!("{}", e));
         }
-        if let Some(transact_sys) = self.trace.action_traces.last() {
-            let ret = transact_sys
+        if let Some(transact) = self.trace.action_traces.last() {
+            let ret = transact
                 .inner_traces
                 .iter()
+                // TODO: improve this filter.. we need to return whatever is the name of the action somehow if possible...
                 .filter_map(|inner| {
                     if let InnerTraceEnum::ActionTrace(at) = &inner.inner {
-                        Some(&at.raw_retval)
+                        if !Self::is_user_action(&at.action) {
+                            return None;
+                        }
+                        if debug {
+                            println!(
+                                ">>> ChainResult::get - Inner action trace: {} (raw_retval={})",
+                                at.action.method, at.raw_retval
+                            );
+                        }
+                        if at.raw_retval.is_empty() {
+                            return None;
+                        } else {
+                            Some(&at.raw_retval)
+                        }
                     } else {
                         None
                     }
                 })
-                .last();
+                .next();
             if let Some(ret) = ret {
-                return Ok(T::unpacked(ret)?);
+                if debug {
+                    println!(">>> ChainResult::get - Unpacking ret: `{}`", ret);
+                }
+                let unpacked_ret = T::unpacked(ret)?;
+                return Ok(unpacked_ret);
             }
         }
         Err(anyhow!("Can't find action in trace"))
@@ -318,10 +751,8 @@ impl<T: fracpack::UnpackOwned> ChainResult<T> {
     }
 }
 
-#[derive(Clone, Debug, Reflect)]
-#[reflect(psibase_mod = "crate")]
+#[derive(Clone, Debug)]
 pub struct ChainPusher<'a> {
-    #[reflect(skip)]
     pub chain: &'a Chain,
     pub sender: AccountNumber,
     pub service: AccountNumber,
@@ -351,6 +782,11 @@ impl<'a> Caller for ChainPusher<'a> {
             transaction: trx.packed().into(),
             proofs: Default::default(),
         });
+
+        if self.chain.is_auto_block_start {
+            self.chain.start_block();
+        }
+
         ChainEmptyResult { trace }
     }
 
@@ -374,9 +810,15 @@ impl<'a> Caller for ChainPusher<'a> {
             transaction: trx.packed().into(),
             proofs: Default::default(),
         });
-        ChainResult::<Ret> {
+        let ret = ChainResult::<Ret> {
             trace,
             _marker: Default::default(),
+        };
+
+        if self.chain.is_auto_block_start {
+            self.chain.start_block();
         }
+
+        ret
     }
 }

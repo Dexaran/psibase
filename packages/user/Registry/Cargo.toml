@@ -1,0 +1,22 @@
+[package]
+name = "registry-pkg"                     # Crate name
+description = "Registry for psibase apps"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[package.metadata.psibase]
+package-name = "Registry"
+services = ["registry"]
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+registry = { path = "service", version = "0.23.0" }
+r-registry = { path = "query", version = "0.23.0" }
+registry-plugin = { path = "plugin", version = "0.23.0" }
+psibase-user-workspace-hack.workspace = true

@@ -1,0 +1,59 @@
+package registry:plugin;
+
+interface types {
+    type account-id = string;
+    type base64-str = string;
+
+    record app-metadata {
+        name: string,
+        short-desc: string,
+        long-desc: string,
+        icon: base64-str,
+        icon-mime-type: string,
+        tags: list<string>,
+    }
+}
+
+/// This is a library that can be used by some top-level app to interact with the app registry.
+/// To avoid attempting to login and submit transactions as the registry app itself, the top level
+///   app should use the StagedTx plugin to allow the user to propose transactions on behalf of an
+///   app account.
+interface developer {
+    use host:types/types.{error};
+    use types.{account-id, app-metadata};
+
+    /// Set the metadata for the caller app
+    /// 
+    /// Initially the app is set to draft status, but if the app is already published,
+    /// it stays published, unless one of the fields in the metadata does not conform
+    /// to the requirements for a published app, in which case the transaction will
+    /// fail.
+    /// 
+    /// Validations:
+    /// * `name` must be between 1 and 30 characters
+    /// * `short-desc` must be between 1 and 100 characters
+    /// * `long-desc` must be between 1 and 1000 characters
+    /// * `icon-mime-type` must be a valid MIME type for an icon (e.g. png, jpeg, svg, x-icon, vnd.microsoft.icon)
+    /// * only three tags are allowed, and they must be lowercase alphanumeric with dashes
+    /// * all the fields are optional if the app is not published
+    set-metadata: func(metadata: app-metadata);
+
+    /// Set caller app to published status
+    /// 
+    /// All of the metadata fields are validated, all fields are required, except for the icon.
+    /// 
+    /// * If the app is already published, the transaction will fail
+    publish: func();
+
+    /// Set caller app to unpublished status
+    /// 
+    /// No fields are validated.
+    /// 
+    /// * If the app is not published, the transaction will fail
+    unpublish: func();
+}
+
+world imports {
+    import types;
+    import developer;
+}

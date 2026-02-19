@@ -1,10 +1,13 @@
+use fracpack::{FracInputStream, Pack, ToSchema, Unpack};
+use serde::{Deserialize, Serialize};
+
 /// Identify database to operate on
 ///
 /// Native functions expose a set of databases which serve
 /// various purposes. This enum identifies which database to
 /// use when invoking those functions.
 #[repr(u32)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum DbId {
     /// Services should store their tables here
     ///
@@ -20,17 +23,6 @@ pub enum DbId {
     /// The first 64 bits of the key match the service.
     WriteOnly,
 
-    /// Data that is not part of consensus
-    ///
-    /// Only accessible to subjective services during transactions,
-    /// but readable by all services during RPC. Doesn't undo
-    /// from aborting transactions, aborting blocks, or forking
-    /// blocks. Individual nodes may modify this database or wipe
-    //  it entirely at will.
-    ///
-    /// The first 64 bits of the key match the service.
-    Subjective,
-
     /// Tables used by native code
     ///
     /// This database enforces constraints during write. Only
@@ -44,14 +36,7 @@ pub enum DbId {
     /// then that node will reject the write. If the producers
     /// accepted the write into a block, then the node will stop
     /// following the chain until it's upgraded to a newer version.
-    NativeConstrained,
-
-    /// Tables used by native code
-    ///
-    /// This database doesn't enforce constraints during write.
-    /// Only writable by privileged services, but readable by all
-    /// services.
-    NativeUnconstrained,
+    Native,
 
     /// Block log
     ///
@@ -129,8 +114,82 @@ pub enum DbId {
     /// block signatures
     BlockProof,
 
+    /// Not accessible to WASM. During joint consensus, this holds a
+    /// subset of native as of the last irreversible block. Outside
+    /// joint consensus, it is empty.
+    PrevAuthServices,
+
     /// Number of defined databases
     ///
     /// This number may grow in the future
-    NumDatabases,
+    NumChainDatabases,
+
+    /// Data that is not part of consensus
+    ///
+    /// Only accessible to subjective services during transactions,
+    /// but readable by all services during RPC. Doesn't undo
+    /// from aborting transactions, aborting blocks, or forking
+    /// blocks. Individual nodes may modify this database or wipe
+    //  it entirely at will.
+    ///
+    /// The first 64 bits of the key match the service.
+    Subjective = BEGIN_INDEPENDENT,
+
+    /// Subjective tables used by native code
+    ///
+    /// Not fully implemented yet and not available to services. Doesn't
+    /// undo from aborting transactions, aborting blocks, or forking
+    /// blocks.
+    NativeSubjective,
+
+    /// Data that is not part of consensus and is not preserved when the
+    /// server exits
+    Session,
+
+    /// Native subjective tables that are not preserved when the server
+    /// exits
+    NativeSession,
+
+    /// Subjective tables that are local to the transaction/query/callback
+    /// context.
+    Temporary,
+}
+
+const BEGIN_INDEPENDENT: u32 = 64;
+const END_INDEPENDENT: u32 = DbId::Temporary as u32 + 1;
+
+impl Pack for DbId {
+    const FIXED_SIZE: u32 = 4;
+
+    const VARIABLE_SIZE: bool = false;
+
+    fn pack(&self, dest: &mut Vec<u8>) {
+        (*self as u32).pack(dest);
+    }
+}
+impl<'a> Unpack<'a> for DbId {
+    const FIXED_SIZE: u32 = 4;
+
+    const VARIABLE_SIZE: bool = false;
+
+    fn unpack(src: &mut FracInputStream<'a>) -> fracpack::Result<Self> {
+        let u32_form = u32::unpack(src)?;
+        if u32_form >= DbId::NumChainDatabases as u32
+            && !(BEGIN_INDEPENDENT..(END_INDEPENDENT as u32)).contains(&u32_form)
+        {
+            return Err(fracpack::Error::BadEnumIndex);
+        }
+        Ok(unsafe { std::mem::transmute(u32_form) })
+    }
+
+    fn verify(src: &mut FracInputStream) -> fracpack::Result<()> {
+        DbId::unpack(src)?;
+        Ok(())
+    }
+}
+
+impl ToSchema for DbId {
+    fn schema(builder: &mut fracpack::SchemaBuilder) -> fracpack::AnyType {
+        u32::schema(builder)
+    }
 }

@@ -1,6 +1,6 @@
 use crate::fracpack::{Pack, UnpackOwned};
-use crate::reflect::Reflect;
-use crate::{get_result_bytes, native_raw, reflect, AccountNumber, Action, MethodNumber, Reflect};
+use crate::services::transact::ServiceMethod;
+use crate::{get_result_bytes, native_raw, AccountNumber, Action, MethodNumber};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -73,8 +73,8 @@ pub trait ProcessActionStruct {
     type Output;
 
     fn process<
-        Return: Reflect + Serialize + DeserializeOwned,
-        ArgStruct: Reflect + Pack + Serialize + DeserializeOwned,
+        Return: Serialize + DeserializeOwned,
+        ArgStruct: Pack + Serialize + DeserializeOwned,
     >(
         self,
     ) -> Self::Output;
@@ -112,18 +112,11 @@ impl Caller for JustSchema {
     fn call<Ret: UnpackOwned, Args: Pack>(&self, _method: MethodNumber, _args: Args) {}
 }
 
-impl reflect::Reflect for JustSchema {
-    type StaticType = Self;
-    fn reflect<V: reflect::Visitor>(_visitor: V) -> V::Return {
-        unimplemented!()
-    }
-}
-
-#[derive(Clone, Default, Reflect)]
-#[reflect(psibase_mod = "crate")]
+#[derive(Clone, Default)]
 pub struct ServiceCaller {
     pub sender: AccountNumber,
     pub service: AccountNumber,
+    pub flags: u64,
 }
 
 impl Caller for ServiceCaller {
@@ -138,7 +131,7 @@ impl Caller for ServiceCaller {
             rawData: args.packed().into(),
         }
         .packed();
-        unsafe { native_raw::call(act.as_ptr(), act.len() as u32) };
+        unsafe { native_raw::call(act.as_ptr(), act.len() as u32, self.flags) };
     }
 
     fn call<Ret: UnpackOwned, Args: Pack>(&self, method: MethodNumber, args: Args) -> Ret {
@@ -149,13 +142,14 @@ impl Caller for ServiceCaller {
             rawData: args.packed().into(),
         }
         .packed();
-        let ret = get_result_bytes(unsafe { native_raw::call(act.as_ptr(), act.len() as u32) });
+        let ret = get_result_bytes(unsafe {
+            native_raw::call(act.as_ptr(), act.len() as u32, self.flags)
+        });
         Ret::unpacked(&ret).unwrap()
     }
 }
 
-#[derive(Clone, Default, Reflect)]
-#[reflect(psibase_mod = "crate")]
+#[derive(Clone, Default)]
 pub struct ActionPacker {
     pub sender: AccountNumber,
     pub service: AccountNumber,
@@ -181,5 +175,39 @@ impl Caller for ActionPacker {
             method,
             rawData: args.packed().into(),
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct RunAsCaller {
+    pub sender: AccountNumber,
+    pub service: AccountNumber,
+    pub allowed_actions: Vec<ServiceMethod>,
+}
+
+impl Caller for RunAsCaller {
+    type ReturnsNothing = ();
+    type ReturnType<T: UnpackOwned> = T;
+
+    fn call_returns_nothing<Args: Pack>(&self, method: MethodNumber, args: Args) {
+        let action = Action {
+            sender: self.sender,
+            service: self.service,
+            method,
+            rawData: args.packed().into(),
+        };
+        crate::services::transact::Wrapper::call().runAs(action, self.allowed_actions.clone());
+    }
+
+    fn call<Ret: UnpackOwned, Args: Pack>(&self, method: MethodNumber, args: Args) -> Ret {
+        let action = Action {
+            sender: self.sender,
+            service: self.service,
+            method,
+            rawData: args.packed().into(),
+        };
+        let ret =
+            crate::services::transact::Wrapper::call().runAs(action, self.allowed_actions.clone());
+        Ret::unpacked(&ret.0).unwrap()
     }
 }

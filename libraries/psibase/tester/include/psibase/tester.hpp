@@ -1,22 +1,24 @@
 #pragma once
-#include <catch2/catch.hpp>
+#include <catch2/catch_tostring.hpp>
 #include <iostream>
 #include <psibase/Actor.hpp>
+#include <psibase/Rpc.hpp>
+#include <psibase/fileUtil.hpp>
 #include <psibase/nativeTables.hpp>
-#include <psibase/print.hpp>
 #include <psibase/trace.hpp>
+#include <psio/to_hex.hpp>
+#include <services/system/PrivateKeyInfo.hpp>
+#include <services/system/Spki.hpp>
+#include <services/system/VirtualServer.hpp>
+#include "services/system/Transact.hpp"
+
+#include <fcntl.h>
 
 namespace psibase
 {
-   namespace internal_use_do_not_use
-   {
-      void hex(const uint8_t* begin, const uint8_t* end, std::ostream& os);
-
-      template <typename R, typename C, typename... Args>
-      R get_return_type(R (C::*f)(Args...));
-      template <typename R, typename C, typename... Args>
-      R get_return_type(R (C::*f)(Args...) const);
-   }  // namespace internal_use_do_not_use
+   using KeyPair = std::pair<SystemService::AuthSig::SubjectPublicKeyInfo,
+                             SystemService::AuthSig::PrivateKeyInfo>;
+   using KeyList = std::vector<KeyPair>;
 
    inline std::string show(bool include, TransactionTrace t)
    {
@@ -25,6 +27,22 @@ namespace psibase
       if (t.error)
          return *t.error;
       return {};
+   }
+
+   inline bool isUserAction(const Action& action)
+   {
+      if (action.service == "db"_a && action.method == "open"_m)
+         return false;
+      if (action.service == "cpu-limit"_a)
+         return false;
+      if (action.sender == SystemService::Transact::service &&
+          action.service == SystemService::VirtualServer::service)
+         return false;
+      if (action.service == "events"_a && action.method == "sync"_m)
+         return false;
+      if (action.sender == AccountNumber{})
+         return false;
+      return true;
    }
 
    inline const ActionTrace& getTopAction(TransactionTrace& t, size_t num)
@@ -44,16 +62,20 @@ namespace psibase
       auto&                           root = t.actionTraces.back();
       std::vector<const ActionTrace*> top_traces;
       for (auto& inner : root.innerTraces)
-         if (std::holds_alternative<ActionTrace>(inner.inner))
-            top_traces.push_back(&std::get<ActionTrace>(inner.inner));
+         if (auto at = std::get_if<ActionTrace>(&inner.inner))
+            if (isUserAction(at->action))
+               top_traces.push_back(at);
+      if (top_traces.size() & 1)
+      {
+         for (const ActionTrace* trace : top_traces)
+         {
+            std::cout << trace->action.service.str() << "::" << trace->action.method.str() << "\n";
+         }
+      }
       check(!(top_traces.size() & 1), "unexpected number of action traces");
       check(2 * num + 1 < top_traces.size(), "trace not found");
       return *top_traces[2 * num + 1];
    }
-
-   std::vector<char> readWholeFile(std::string_view filename);
-
-   int32_t execute(std::string_view command);
 
    /**
     * Validates the status of a transaction.  If expectedExcept is "", then the
@@ -61,11 +83,6 @@ namespace psibase
     * part of the error message.
     */
    void expect(TransactionTrace t, const std::string& expected = "", bool always_show = false);
-
-   /**
-    * Sign a digest
-    */
-   Signature sign(const PrivateKey& key, const Checksum256& digest);
 
    class TraceResult
    {
@@ -88,10 +105,13 @@ namespace psibase
       Result(TransactionTrace&& t)
           : TraceResult(std::forward<TransactionTrace>(t)), _return(std::nullopt)
       {
-         auto actionTrace = getTopAction(t, 0);
-         if (actionTrace.rawRetval.size() != 0)
+         if (!_t.error.has_value())
          {
-            _return = psio::convert_from_frac<ReturnType>(actionTrace.rawRetval);
+            auto actionTrace = getTopAction(t, 0);
+            if (actionTrace.rawRetval.size() != 0)
+            {
+               _return = psio::from_frac<ReturnType>(actionTrace.rawRetval);
+            }
          }
       }
 
@@ -99,7 +119,7 @@ namespace psibase
       {
          if (_t.error.has_value())
          {
-            psibase::print(prettyTrace(trimRawData(_t)).c_str());
+            std::cout << prettyTrace(trimRawData(_t)).c_str();
          }
 
          if (_return.has_value())
@@ -124,9 +144,93 @@ namespace psibase
       Result(TransactionTrace&& t) : TraceResult(std::forward<TransactionTrace>(t)) {}
    };
 
+   struct DatabaseConfig
+   {
+      std::uint64_t hotBytes  = 1ull << 27;
+      std::uint64_t warmBytes = 1ull << 27;
+      std::uint64_t coolBytes = 1ull << 27;
+      std::uint64_t coldBytes = 1ull << 27;
+   };
+
+   template <typename T>
+   concept HttpRequestBody = requires(const T& t) {
+      { t.contentType() } -> std::convertible_to<std::string>;
+      { t.body() } -> std::convertible_to<std::vector<char>>;
+   };
+
+   struct GraphQLBody
+   {
+      std::string       contentType() const { return "application/graphql"; }
+      std::vector<char> body() const { return {text.begin(), text.end()}; }
+      std::string_view  text;
+   };
+
+   template <typename T>
+   struct FracPackBody
+   {
+      std::string       contentType() const { return "application/octet-stream"; }
+      std::vector<char> body() const { return psio::to_frac(value); }
+      T                 value;
+   };
+
+   template <typename R>
+   R unpackReply(HttpReply&& response)
+   {
+      if constexpr (std::is_convertible_v<HttpReply, R>)
+      {
+         return std::move(response);
+      }
+      else
+      {
+         if (response.status != HttpStatus::ok)
+         {
+            if (response.contentType == "text/html")
+            {
+               abortMessage(std::to_string(static_cast<std::uint16_t>(response.status)) + " " +
+                            std::string(response.body.begin(), response.body.end()));
+            }
+            else
+            {
+               abortMessage("Request returned " +
+                            std::to_string(static_cast<std::uint16_t>(response.status)));
+            }
+         }
+         if (response.contentType != "application/json")
+            abortMessage("Wrong Content-Type " + response.contentType);
+         response.body.push_back('\0');
+         psio::json_token_stream stream(response.body.data());
+         return psio::from_json<R>(stream);
+      }
+   }
+
+   struct AsyncHttpReply
+   {
+      std::int32_t             fd;
+      std::optional<HttpReply> poll();
+      template <typename R>
+      std::optional<R> poll()
+      {
+         if (auto reply = poll())
+         {
+            return unpackReply<R>(std::move(*reply));
+         }
+         else
+         {
+            return {};
+         }
+      }
+      template <typename R = HttpReply>
+      R get()
+      {
+         auto reply = poll();
+         if (!reply)
+            abortMessage("HTTP response not available");
+         return unpackReply<R>(std::move(*reply));
+      }
+   };
+
    /**
     * Manages a chain.
-    * Only one TestChain can exist at a time.
     * The test chain uses simulated time.
     */
    class TestChain
@@ -134,21 +238,52 @@ namespace psibase
      private:
       uint32_t                          id;
       std::optional<psibase::StatusRow> status;
-      bool                              producing = false;
+      bool                              producing        = false;
+      bool                              isAutoBlockStart = true;
+      bool                              isAutoRun        = true;
+      bool                              isPublicChain;
+
+      explicit TestChain(uint32_t chain_id,
+                         bool     clone,
+                         bool     pub       = true,
+                         bool     init      = true,
+                         bool     writeable = true);
+      void setSignature(BlockNum blockNum, std::vector<char> sig);
 
      public:
-      static const PublicKey  defaultPubKey;
-      static const PrivateKey defaultPrivKey;
-
-      TestChain(uint64_t max_objects    = 1'000'000,
-                uint64_t hot_addr_bits  = 27,
-                uint64_t warm_addr_bits = 27,
-                uint64_t cool_addr_bits = 27,
-                uint64_t cold_addr_bits = 27);
-      TestChain(const TestChain&) = delete;
+      // Clones the chain
+      TestChain(const TestChain&, bool pub);
+      /**
+       * Creates a new temporary chain.
+       *
+       * @param pub If this is the only public chain, it will be automatically
+       * selected.
+       */
+      explicit TestChain(const DatabaseConfig&, bool pub = true);
+      /**
+       * Opens a chain.
+       *
+       * @param flags must include at least either O_RDONLY or O_RDWR, and
+       * can also contain O_CREAT, O_EXCL, and O_TRUNC.
+       */
+      TestChain(std::string_view      path,
+                int                   flags = O_CREAT | O_RDWR,
+                const DatabaseConfig& cfg   = {},
+                bool                  pub   = true);
+      TestChain(uint64_t hot_bytes  = 1ull << 27,
+                uint64_t warm_bytes = 1ull << 27,
+                uint64_t cool_bytes = 1ull << 27,
+                uint64_t cold_bytes = 1ull << 27);
       virtual ~TestChain();
 
       TestChain& operator=(const TestChain&) = delete;
+
+      static std::string defaultPackageDir();
+
+      /**
+       * Boots the chain.
+       */
+      void boot(const std::vector<std::string>& names, bool installUI);
 
       /**
        * Shuts down the chain to allow copying its state file. The chain's temporary path will
@@ -157,37 +292,65 @@ namespace psibase
       void shutdown();
 
       /**
-       * Get the temporary path which contains the chain's blocks and states directories
+       * By default, the TestChain will automatically advance blocks.
+       * When autoBlockStart is disabled, the the chain will only advance blocks manually.
+       * To manually advance a block, you must call startBlock.
+       *
+       * @param enable Whether the chain should automatically advance blocks.
        */
-      std::string getPath();
+      void setAutoBlockStart(bool enable);
+
+      /**
+       * By default the TestChain will automatically process
+       * the run table and transactions provided by services.
+       * When autoRun is disabled, the chain will only run
+       * them manually.
+       */
+      void setAutoRun(bool enable);
 
       /**
        * Start a new pending block.  If a block is currently pending, finishes it first.
        * May push additional blocks if any time is skipped.
        *
-       * @param skip_milliseconds The amount of time to skip in addition to the 500 ms block time.
-       * truncated to a multiple of 500 ms.
+       * @param skip_milliseconds The amount of time to skip in addition to the 1s block time.
+       * truncated to a multiple of 1s.
        */
       void startBlock(int64_t skip_miliseconds = 0);
 
       void startBlock(std::string_view time);
 
-      void startBlock(TimePointSec tp);
+      void startBlock(BlockTime tp);
 
       /**
        * Finish the current pending block.  If no block is pending, creates an empty block.
        */
       void finishBlock();
 
+      template <typename F>
+      void finishBlock(F&& sign)
+      {
+         finishBlock();
+         auto               status = kvGet<StatusRow>(StatusRow::db, statusKey()).value();
+         const auto&        head   = status.head.value();
+         BlockSignatureInfo preimage{head};
+         setSignature(head.header.blockNum, sign(static_cast<std::span<const char>>(preimage)));
+      }
+
       /*
        * Set the reference block of the transaction to the head block.
        */
-      void fillTapos(Transaction& t, uint32_t expire_sec = 2);
+      void fillTapos(Transaction& t, uint32_t expire_sec = 2) const;
 
       /*
        * Creates a transaction.
        */
-      Transaction makeTransaction(std::vector<Action>&& actions = {});
+      Transaction makeTransaction(std::vector<Action>&& actions    = {},
+                                  uint32_t              expire_sec = 2) const;
+
+      /**
+       * Signs a transaction with the provided keys.
+       */
+      SignedTransaction signTransaction(Transaction trx, const KeyList& keys = {});
 
       /**
        * Pushes a transaction onto the chain.  If no block is currently pending, starts one.
@@ -197,44 +360,143 @@ namespace psibase
       /**
        * Pushes a transaction onto the chain.  If no block is currently pending, starts one.
        */
-      [[nodiscard]] TransactionTrace pushTransaction(
-          Transaction                                          trx,
-          const std::vector<std::pair<PublicKey, PrivateKey>>& keys = {
-              {defaultPubKey, defaultPrivKey}});
+      [[nodiscard]] TransactionTrace pushTransaction(Transaction trx, const KeyList& keys = {});
 
       /**
-       * Pushes a transaction onto the chain.  If no block is currently pending, starts one.
-       *
-       * Validates the transaction status according to @ref eosio::expect.
+       * Switches to the block before the new block, and then applies it.
        */
-      TransactionTrace transact(std::vector<Action>&&                                actions,
-                                const std::vector<std::pair<PublicKey, PrivateKey>>& keys,
-                                const char* expectedExcept = nullptr);
-      TransactionTrace transact(std::vector<Action>&& actions,
-                                const char*           expectedExcept = nullptr);
+      void pushBlock(const SignedBlock& block);
 
-      template <typename Action, typename... Args>
-      auto trace(const std::optional<std::vector<std::vector<char>>>& cfd,
-                 const Action&                                        action,
-                 Args&&... args)
+      /**
+       * Runs the nextTransaction callback to find the
+       * next transaction and pushes it. If there was
+       * a transaction, returns its trace.
+       */
+      std::optional<TransactionTrace> pushNextTransaction();
+      /**
+       * Reads the first RunRow and executes it. Returns true
+       * if there was anything to do.
+       */
+      bool runQueueItem();
+      /**
+       * Runs pending work to completion.
+       * - pushNextTransaction
+       * - runQueueItem
+       */
+      void runAll();
+
+      /**
+       * Creates a POST request with a JSON body
+       */
+      template <typename T>
+      HttpRequest makePost(AccountNumber                   account,
+                           std::string_view                target,
+                           const T&                        data,
+                           std::optional<std::string_view> token = std::nullopt) const
       {
-         if (!cfd)
+         HttpRequest req{.host   = account.str() + ".psibase.io",
+                         .method = "POST",
+                         .target{target},
+                         .contentType = "application/json"};
+         if (token)
          {
-            return pushTransaction(makeTransaction({action.to_action(std::forward<Args>(args)...)}),
-                                   {defaultPrivKey});
+            req.headers.push_back(
+                {.name = "Authorization", .value = std::string("Bearer ") + std::string(*token)});
          }
-         else
+         psio::vector_stream stream{req.body};
+         using psio::to_json;
+         to_json(data, stream);
+         return req;
+      }
+
+      /**
+       * Creates a POST request
+       */
+      template <HttpRequestBody T>
+      HttpRequest makePost(AccountNumber                   account,
+                           std::string_view                target,
+                           const T&                        data,
+                           std::optional<std::string_view> token = std::nullopt) const
+      {
+         HttpRequest req{.host   = account.str() + ".psibase.io",
+                         .method = "POST",
+                         .target{target},
+                         .contentType = data.contentType(),
+                         .body        = data.body()};
+         if (token)
          {
-            return pushTransaction(
-                makeTransaction({}, {action.to_action(std::forward<Args>(args)...)}),
-                {defaultPrivKey}, *cfd);
+            req.headers.push_back(
+                {.name = "Authorization", .value = std::string("Bearer ") + std::string(*token)});
          }
+         return req;
+      }
+
+      /**
+       * Creates a GET request
+       */
+      HttpRequest makeGet(AccountNumber                   account,
+                          std::string_view                target,
+                          std::optional<std::string_view> token = std::nullopt) const
+      {
+         HttpRequest req{.host = account.str() + ".psibase.io", .method = "GET", .target{target}};
+         if (token)
+         {
+            req.headers.push_back(
+                {.name = "Authorization", .value = std::string("Bearer ") + std::string(*token)});
+         }
+         return req;
+      }
+
+      /**
+       * Runs a query and returns the response
+       */
+      HttpReply http(const HttpRequest& request);
+      /**
+       * Runs a query and deserializes the body of the response
+       */
+      template <typename R>
+      R http(const HttpRequest& request)
+      {
+         return unpackReply<R>(http(request));
+      }
+
+      template <typename R = HttpReply, typename T>
+      R post(AccountNumber                   account,
+             std::string_view                target,
+             const T&                        data,
+             std::optional<std::string_view> token = std::nullopt)
+      {
+         return http<R>(makePost(account, target, data, token));
+      }
+
+      template <typename R = HttpReply>
+      R get(AccountNumber                   account,
+            std::string_view                target,
+            std::optional<std::string_view> token = std::nullopt)
+      {
+         return http<R>(makeGet(account, target, token));
+      }
+
+      /**
+       * Login to a service with an account that uses auth-any (no proofs needed to login)
+       */
+      std::string login(AccountNumber user, AccountNumber service);
+
+      AsyncHttpReply asyncHttp(const HttpRequest& request);
+      template <typename T>
+      AsyncHttpReply asyncPost(AccountNumber account, std::string_view target, const T& data)
+      {
+         return asyncHttp(makePost(account, target, data));
+      }
+      AsyncHttpReply asyncGet(AccountNumber account, std::string_view target)
+      {
+         return asyncHttp(makeGet(account, target));
       }
 
       template <typename Action>
-      auto trace(Action&& a)
+      auto trace(Action&& a, const KeyList& keyList = {})
       {
-         return pushTransaction(makeTransaction({a}));
+         return pushTransaction(makeTransaction({a}), keyList);
       }
 
       /**
@@ -242,24 +504,30 @@ namespace psibase
        */
       struct PushTransactionProxy
       {
-         PushTransactionProxy(TestChain& t, AccountNumber s, AccountNumber r)
-             : chain(t), sender(s), receiver(r)
+         PushTransactionProxy(TestChain& t, AccountNumber s, AccountNumber r, const KeyList& keys)
+             : chain(t), sender(s), receiver(r), keys(keys)
          {
          }
 
          TestChain&    chain;
          AccountNumber sender;
          AccountNumber receiver;
+         KeyList       keys;
 
-         template <uint32_t idx, uint64_t Name, auto MemberPtr, typename... Args>
+         template <uint32_t idx, auto MemberPtr, typename... Args>
          auto call(Args&&... args) const
          {
             using result_type = decltype(psio::result_of(MemberPtr));
 
             auto act = action_builder_proxy(sender, receiver)
-                           .call<idx, Name, MemberPtr, Args...>(std::forward<Args>(args)...);
+                           .call<idx, MemberPtr, Args...>(std::forward<Args>(args)...);
 
-            return Result<result_type>(chain.trace(act));
+            if (chain.isAutoBlockStart)
+            {
+               chain.startBlock(0);
+            }
+
+            return Result<result_type>(chain.trace(act, keys));
          }
       };
 
@@ -268,26 +536,88 @@ namespace psibase
       {
          using base = typename psio::reflect<Service>::template proxy<PushTransactionProxy>;
          using base::base;
-
-         auto* operator->() const { return this; }
-         auto& operator*() const { return *this; }
       };
 
       struct UserContext
       {
          TestChain&    t;
          AccountNumber id;
+         KeyList       signingKeys;
 
          template <typename Other>
          auto to() const
          {
-            return ServiceUser<Other>(t, id, Other::service);
+            return ServiceUser<Other>(t, id, Other::service, signingKeys);
+         }
+
+         auto with(const KeyList& signingKeys)
+         {  //
+            return UserContext{t, id, signingKeys};
          }
 
          operator AccountNumber() { return id; }
       };
 
-      auto from(AccountNumber id) { return UserContext{*this, id}; }
+      auto from(AccountNumber id) { return UserContext{*this, id, {}}; }
+
+      template <typename Other>
+      auto to()
+      {
+         return ServiceUser<Other>(*this, Other::service, Other::service, KeyList{});
+      }
+
+      std::uint32_t nativeHandle() const { return id; }
+
+      /// Get a key-value pair, if any
+      std::optional<std::vector<char>> kvGetRaw(psibase::DbId db, psio::input_stream key);
+
+      /// Get a key-value pair, if any
+      template <typename V, typename K>
+      std::optional<V> kvGet(psibase::DbId db, const K& key)
+      {
+         auto v = kvGetRaw(db, psio::convert_to_key(key));
+         if (!v)
+            return std::nullopt;
+         // TODO: validate (allow opt-in or opt-out)
+         return psio::from_frac<V>(psio::prevalidated{*v});
+      }
+
+      /// Get a key-value pair, if any
+      template <typename V, typename K>
+      std::optional<V> kvGet(const K& key)
+      {
+         return kvGet<V>(psibase::DbId::service, key);
+      }
+
+      std::optional<std::vector<char>> kvGreaterEqualRaw(DbId               db,
+                                                         psio::input_stream key,
+                                                         uint32_t           matchKeySize);
+
+      template <typename V, typename K>
+      inline std::optional<V> kvGreaterEqual(DbId db, const K& key, uint32_t matchKeySize)
+      {
+         auto v = kvGreaterEqualRaw(db, psio::convert_to_key(key), matchKeySize);
+         if (!v)
+            return std::nullopt;
+         return psio::from_frac<V>(*v);
+      }
+
+      void kvPutRaw(DbId db, psio::input_stream key, psio::input_stream value);
+
+      template <typename K, typename V>
+      void kvPut(DbId db, const K& key, const V& value)
+      {
+         kvPutRaw(db, psio::convert_to_key(key), psio::convert_to_frac(value));
+      }
    };  // TestChain
 
 }  // namespace psibase
+
+template <>
+struct Catch::StringMaker<psibase::Checksum256>
+{
+   static std::string convert(const psibase::Checksum256& obj)
+   {
+      return psio::hex(obj.begin(), obj.end());
+   }
+};

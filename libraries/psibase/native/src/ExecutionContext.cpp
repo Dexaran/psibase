@@ -5,10 +5,12 @@
 #include <boost/multi_index/ordered_index.hpp>
 #include <boost/multi_index/sequenced_index.hpp>
 #include <boost/multi_index_container.hpp>
+#include <debug_eos_vm/debug_eos_vm.hpp>
 #include <eosio/vm/backend.hpp>
 #include <mutex>
 #include <psibase/ActionContext.hpp>
 #include <psibase/db.hpp>
+#include <psio/finally.hpp>
 #include <psio/from_bin.hpp>
 
 namespace bmi = boost::multi_index;
@@ -18,8 +20,12 @@ using eosio::vm::span;
 namespace psibase
 {
    struct ExecutionContextImpl;
-   using rhf_t     = eosio::vm::registered_host_functions<ExecutionContextImpl>;
-   using backend_t = eosio::vm::backend<rhf_t, eosio::vm::jit, VMOptions>;
+   using rhf_t = eosio::vm::registered_host_functions<ExecutionContextImpl>;
+#ifdef __x86_64__
+   using backend_t = eosio::vm::backend<rhf_t, eosio::vm::jit_profile, VMOptions>;
+#else
+   using backend_t = eosio::vm::backend<rhf_t, eosio::vm::interpreter, VMOptions>;
+#endif
 
    // Rethrow with detailed info
    template <typename F>
@@ -63,7 +69,6 @@ namespace psibase
          codeObj->vmVersion = vmVersion;
          codeObj->code.assign(code.pos, code.end);
       }
-      ++codeObj->numRefs;
       database.kvPut(CodeByHashRow::db, codeObj->key(), *codeObj);
    }  // setCode
 
@@ -72,6 +77,9 @@ namespace psibase
       Checksum256                hash;
       VMOptions                  vmOptions;
       std::unique_ptr<backend_t> backend;
+#ifdef __x86_64__
+      std::shared_ptr<dwarf::debugger_registration> debug;
+#endif
 
       auto byHash() const { return std::tie(hash, vmOptions); }
    };
@@ -101,17 +109,17 @@ namespace psibase
             ind.pop_front();
       }
 
-      std::unique_ptr<backend_t> get(const Checksum256& hash, const VMOptions& vmOptions)
+      BackendEntry get(const Checksum256& hash, const VMOptions& vmOptions)
       {
-         std::unique_ptr<backend_t>  result;
+         BackendEntry                result{hash, vmOptions};
          std::lock_guard<std::mutex> lock{mutex};
          auto&                       ind = backends.get<ByHash>();
          auto                        it  = ind.find(std::tie(hash, vmOptions));
          if (it == ind.end())
             return result;
-         ind.modify(it, [&](auto& x) { result = std::move(x.backend); });
+         ind.modify(it, [&](auto& x) { result = std::move(x); });
          ind.erase(it);
-         result->get_module().allocator.enable_code(true);
+         result.backend->get_module().allocator.enable_code(true);
          return result;
       }
    };
@@ -123,6 +131,19 @@ namespace psibase
    WasmCache::WasmCache(WasmCache&& src) : impl{std::move(src.impl)} {}
 
    WasmCache::~WasmCache() {}
+
+   std::vector<std::span<const char>> WasmCache::span() const
+   {
+      std::vector<std::span<const char>> result;
+      std::lock_guard                    lock{impl->mutex};
+      for (const auto& backend : impl->backends)
+      {
+         auto& alloc = backend.backend->get_module().allocator;
+         result.push_back({alloc._base, alloc._capacity});
+         result.push_back({alloc._code_base, alloc._code_size});
+      }
+      return result;
+   }
 
    struct ExecutionMemoryImpl
    {
@@ -141,48 +162,106 @@ namespace psibase
    }
    ExecutionMemory::~ExecutionMemory() {}
 
+   std::span<const char> ExecutionMemory::span() const
+   {
+      auto        raw         = impl->wa.get_base_ptr<const char>();
+      std::size_t syspagesize = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+      return {raw - syspagesize, eosio::vm::max_memory + 2 * syspagesize};
+   }
+
    // TODO: debugger
    struct ExecutionContextImpl : NativeFunctions
    {
-      VMOptions                  vmOptions;
-      eosio::vm::wasm_allocator& wa;
-      std::unique_ptr<backend_t> backend;
-      std::atomic<bool>          timedOut    = false;
-      bool                       initialized = false;
+      VMOptions                                     vmOptions;
+      eosio::vm::wasm_allocator&                    wa;
+      BackendEntry                                  backend;
+      std::shared_ptr<dwarf::debugger_registration> dbg;
+      std::atomic<bool>                             timedOut    = false;
+      bool                                          initialized = false;
 
       ExecutionContextImpl(TransactionContext& transactionContext,
                            const VMOptions&    vmOptions,
                            ExecutionMemory&    memory,
                            AccountNumber       service)
           : NativeFunctions{transactionContext.blockContext.db, transactionContext,
-                            transactionContext.allowDbRead, transactionContext.allowDbWrite,
-                            transactionContext.allowDbReadSubjective},
+                            transactionContext.dbMode},
             vmOptions{vmOptions},
             wa{memory.impl->wa}
       {
-         auto ca = database.kvGet<CodeRow>(CodeRow::db, codeKey(service));
-         check(ca.has_value(), "unknown service account");
-         check(ca->codeHash != Checksum256{}, "account has no code");
-         code   = std::move(*ca);
+         database.checkoutSubjective();
+         psio::finally _{[&] { database.abortSubjective(); }};
+         auto [ca, db] = getCode(service);
+
+         code   = std::move(ca);
          auto c = database.kvGet<CodeByHashRow>(
-             CodeByHashRow::db, codeByHashKey(code.codeHash, code.vmType, code.vmVersion));
-         check(c.has_value(), "code record is missing");
+             db, codeByHashKey(code.codeHash, code.vmType, code.vmVersion));
+         check(c.has_value(), "service code record is missing");
          check(c->vmType == 0, "vmType is not 0");
          check(c->vmVersion == 0, "vmVersion is not 0");
+         if (transactionContext.dbMode.verifyOnly)
+         {
+            check(code.flags & CodeRow::isVerify,
+                  "service account " + service.str() + " cannot be used in verify mode");
+            // Ignore all other flags
+            code.flags &= CodeRow::isVerify;
+         }
          rethrowVMExcept(
              [&]
              {
                 backend = transactionContext.blockContext.systemContext.wasmCache.impl->get(
                     code.codeHash, vmOptions);
-                if (!backend)
-                   backend = std::make_unique<backend_t>(c->code, nullptr, vmOptions);
+                if (!backend.backend)
+                {
+                   psio::input_stream s{reinterpret_cast<const char*>(c->code.data()),
+                                        c->code.size()};
+#ifdef __x86_64__
+                   if (dwarf::has_debug_info(s))
+                   {
+                      debug_eos_vm::debug_instr_map debug;
+                      backend.backend =
+                          std::make_unique<backend_t>(c->code, nullptr, vmOptions, debug);
+                      auto info     = dwarf::get_info_from_wasm(s);
+                      backend.debug = dwarf::register_with_debugger(
+                          info, debug.locs, backend.backend->get_module(), s);
+                   }
+                   else
+                   {
+                      backend.backend = std::make_unique<backend_t>(c->code, nullptr, vmOptions);
+                      backend.debug = dwarf::register_with_debugger(backend.backend->get_module());
+                   }
+#else
+                   backend.backend = std::make_unique<backend_t>(c->code, nullptr, vmOptions);
+#endif
+                }
              });
       }
 
       ~ExecutionContextImpl()
       {
-         transactionContext.blockContext.systemContext.wasmCache.impl->add(
-             {code.codeHash, vmOptions, std::move(backend)});
+         transactionContext.blockContext.systemContext.wasmCache.impl->add(std::move(backend));
+      }
+
+      eosio::vm::stack_manager& getAltStack() { return transactionContext.getAltStack(); }
+
+      std::pair<CodeRow, DbId> getCode(AccountNumber service)
+      {
+         if (dbMode.isSubjective)
+         {
+            // Check subjective first, then objective
+            auto ca = database.kvGet<CodeRow>(DbId::nativeSubjective, codeKey(service));
+            if (ca.has_value() && ca->codeHash != Checksum256{})
+            {
+               ca->flags &= CodeRow::localServiceFlags;
+               ca->flags |= ExecutionContext::isLocal;
+               return {std::move(*ca), DbId::nativeSubjective};
+            }
+         }
+         // Use objective service
+         auto ca = database.kvGet<CodeRow>(DbId::native, codeKey(service));
+         check(ca.has_value(), "unknown service account: " + service.str());
+         check(ca->codeHash != Checksum256{}, "service account has no code");
+         ca->flags &= CodeRow::chainServiceFlags;
+         return {std::move(*ca), DbId::native};
       }
 
       void init()
@@ -191,9 +270,10 @@ namespace psibase
              [&]
              {
                 // auto startTime = std::chrono::steady_clock::now();
-                backend->set_wasm_allocator(&wa);
-                backend->initialize(this);
-                (*backend)(*this, "env", "start", currentActContext->action.service.value);
+                backend.backend->set_wasm_allocator(&wa);
+                backend.backend->initialize(getAltStack(), this);
+                (*backend.backend)(getAltStack(), *this, "env", "start",
+                                   currentActContext->action.service.value);
                 initialized = true;
                 // auto us     = std::chrono::duration_cast<std::chrono::microseconds>(
                 //     std::chrono::steady_clock::now() - startTime);
@@ -201,13 +281,32 @@ namespace psibase
              });
       }
 
+      struct RecordActionTime
+      {
+         explicit RecordActionTime(ActionContext& actionContext) : actionContext(actionContext)
+         {
+            actionContext.actionTrace.totalTime =
+                actionContext.transactionContext.getBillableTime();
+         }
+         ~RecordActionTime()
+         {
+            actionContext.actionTrace.totalTime =
+                actionContext.transactionContext.getBillableTime() -
+                actionContext.actionTrace.totalTime;
+         }
+         ActionContext& actionContext;
+      };
+
       template <typename F>
       void exec(ActionContext& actionContext, F f)
       {
          auto prev         = currentActContext;
          currentActContext = &actionContext;
+         RecordActionTime timer{actionContext};
          try
          {
+            backend.backend->get_context().set_max_call_depth(
+                actionContext.transactionContext.remainingStack);
             if (!initialized)
                init();
             rethrowVMExcept(f);
@@ -221,6 +320,12 @@ namespace psibase
          currentActContext = prev;
       }
 
+      void onTransferControl(std::uint64_t callerFlags)
+      {
+         transactionContext.importedHandles.clear();
+         std::swap(transactionContext.exportedHandles, transactionContext.importedHandles);
+      }
+
    };  // ExecutionContextImpl
 
    ExecutionContext::ExecutionContext(TransactionContext& transactionContext,
@@ -229,11 +334,13 @@ namespace psibase
                                       AccountNumber       service)
    {
       impl = std::make_unique<ExecutionContextImpl>(transactionContext, vmOptions, memory, service);
+      impl->currentExecContext = this;
    }
 
    ExecutionContext::ExecutionContext(ExecutionContext&& src)
    {
-      impl = std::move(src.impl);
+      impl                     = std::move(src.impl);
+      impl->currentExecContext = this;
    }
    ExecutionContext::~ExecutionContext() {}
 
@@ -246,11 +353,17 @@ namespace psibase
       rhf_t::add<&ExecutionContextImpl::getKey>("env", "getKey");
       rhf_t::add<&ExecutionContextImpl::writeConsole>("env", "writeConsole");
       rhf_t::add<&ExecutionContextImpl::abortMessage>("env", "abortMessage");
-      // rhf_t::add<&ExecutionContextImpl::getBillableTime>("env", "getBillableTime");
-      // rhf_t::add<&ExecutionContextImpl::setMaxTransactionTime>("env", "setMaxTransactionTime");
+      rhf_t::add<&ExecutionContextImpl::clockTimeGet>("env", "clockTimeGet");
+      rhf_t::add<&ExecutionContextImpl::getRandom>("env", "getRandom");
+      rhf_t::add<&ExecutionContextImpl::setMaxCpuTime>("env", "setMaxCpuTime");
       rhf_t::add<&ExecutionContextImpl::getCurrentAction>("env", "getCurrentAction");
       rhf_t::add<&ExecutionContextImpl::call>("env", "call");
       rhf_t::add<&ExecutionContextImpl::setRetval>("env", "setRetval");
+      rhf_t::add<&ExecutionContextImpl::kvOpen>("env", "kvOpen");
+      rhf_t::add<&ExecutionContextImpl::kvOpenAt>("env", "kvOpenAt");
+      rhf_t::add<&ExecutionContextImpl::kvClose>("env", "kvClose");
+      rhf_t::add<&ExecutionContextImpl::exportHandles>("env", "exportHandles");
+      rhf_t::add<&ExecutionContextImpl::importHandles>("env", "importHandles");
       rhf_t::add<&ExecutionContextImpl::kvPut>("env", "kvPut");
       rhf_t::add<&ExecutionContextImpl::putSequential>("env", "putSequential");
       rhf_t::add<&ExecutionContextImpl::kvRemove>("env", "kvRemove");
@@ -260,63 +373,61 @@ namespace psibase
       rhf_t::add<&ExecutionContextImpl::kvLessThan>("env", "kvLessThan");
       rhf_t::add<&ExecutionContextImpl::kvMax>("env", "kvMax");
       // rhf_t::add<&ExecutionContextImpl::kvGetTransactionUsage>("env", "kvGetTransactionUsage");
+      rhf_t::add<&ExecutionContextImpl::checkoutSubjective>("env", "checkoutSubjective");
+      rhf_t::add<&ExecutionContextImpl::commitSubjective>("env", "commitSubjective");
+      rhf_t::add<&ExecutionContextImpl::abortSubjective>("env", "abortSubjective");
+      rhf_t::add<&ExecutionContextImpl::socketOpen>("env", "socketOpen");
+      rhf_t::add<&ExecutionContextImpl::socketSend>("env", "socketSend");
+      rhf_t::add<&ExecutionContextImpl::socketSetFlags>("env", "socketSetFlags");
+   }
+
+   std::uint32_t ExecutionContext::remainingStack() const
+   {
+      return impl->backend.backend->get_context().get_remaining_call_depth();
    }
 
    void ExecutionContext::execProcessTransaction(ActionContext& actionContext)
    {
       impl->exec(actionContext, [&] {  //
-         (*impl->backend)(*impl, "env", "processTransaction");
+         (*impl->backend.backend)(impl->getAltStack(), *impl, "env", "processTransaction");
       });
    }
 
    void ExecutionContext::execCalled(uint64_t callerFlags, ActionContext& actionContext)
    {
-      // Prevents a poison block
-      if (!(impl->code.flags & CodeRow::isSubjective))
-         check(!(callerFlags & CodeRow::isSubjective),
-               "subjective services may not call non-subjective ones");
+      impl->onTransferControl(callerFlags);
+      auto cleanup = psio::finally{[&] { impl->onTransferControl(callerFlags); }};
 
-      auto& bc = impl->transactionContext.blockContext;
-      if ((impl->code.flags & CodeRow::isSubjective) && !bc.isProducing)
+      if ((callerFlags & (callerSudo | isLocal)) == callerSudo)
       {
-         check(bc.nextSubjectiveRead < bc.current.subjectiveData.size(), "missing subjective data");
-         impl->currentActContext->actionTrace.rawRetval =
-             bc.current.subjectiveData[bc.nextSubjectiveRead++];
-         return;
+         check((impl->code.flags & (isLocal | CodeRow::isReplacement)) != isLocal,
+               "on-chain service cannot sudo when calling a node-local service");
       }
 
       impl->exec(actionContext, [&] {  //
-         (*impl->backend)(*impl, "env", "called", actionContext.action.service.value,
-                          actionContext.action.sender.value);
-      });
-
-      if ((impl->code.flags & CodeRow::isSubjective) && !(callerFlags & CodeRow::isSubjective))
-         bc.current.subjectiveData.push_back(impl->currentActContext->actionTrace.rawRetval);
-   }
-
-   void ExecutionContext::execVerify(ActionContext& actionContext)
-   {
-      impl->exec(actionContext, [&] {  //
-         // auto startTime = std::chrono::steady_clock::now();
-         (*impl->backend)(*impl, "env", "verify");
-         // auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-         //     std::chrono::steady_clock::now() - startTime);
-         // std::cout << "verify: " << us.count() << " us\n";
+         (*impl->backend.backend)(impl->getAltStack(), *impl, "env", "called",
+                                  actionContext.action.service.value,
+                                  actionContext.action.sender.value);
       });
    }
 
    void ExecutionContext::execServe(ActionContext& actionContext)
    {
       impl->exec(actionContext, [&] {  //
-         (*impl->backend)(*impl, "env", "serve");
+         (*impl->backend.backend)(impl->getAltStack(), *impl, "env", "serve");
+      });
+   }
+
+   void ExecutionContext::exec(ActionContext& actionContext, std::string_view fn)
+   {
+      impl->exec(actionContext, [&] {  //
+         (*impl->backend.backend)(impl->getAltStack(), *impl, "env", fn);
       });
    }
 
    void ExecutionContext::asyncTimeout()
    {
-      if (impl->code.flags & CodeRow::canNotTimeOut)
-         return;
       impl->timedOut = true;
-      impl->backend->get_module().allocator.disable_code();
+      impl->backend.backend->get_module().allocator.disable_code();
    }
 }  // namespace psibase

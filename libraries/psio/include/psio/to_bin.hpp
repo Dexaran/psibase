@@ -107,7 +107,8 @@ namespace psio
       varuint32_to_bin(obj.size(), stream);
       if constexpr (has_bitwise_serialization<T>())
       {
-         stream.write(reinterpret_cast<const char*>(obj.data()), obj.size() * sizeof(T));
+         if (!obj.empty())
+            stream.write(reinterpret_cast<const char*>(obj.data()), obj.size() * sizeof(T));
       }
       else
       {
@@ -181,14 +182,8 @@ namespace psio
       }
       else
       {
-         reflect<T>::for_each(
-             [&](const psio::meta&, auto member)
-             {
-                if constexpr (not std::is_member_function_pointer_v<decltype(member(&obj))>)
-                {
-                   to_bin(obj.*member(&obj), stream);
-                }
-             });
+         psio::apply_members((typename reflect<T>::data_members*)nullptr,
+                             [&](auto... member) { (to_bin(obj.*member, stream), ...); });
       }
    }
 

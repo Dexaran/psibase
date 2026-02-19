@@ -8,21 +8,10 @@ use custom_error::custom_error;
 use fracpack::{Pack, UnpackOwned};
 
 use crate::{
-    get_key_bytes, get_service, kv_get, kv_get_bytes, kv_greater_equal_bytes, kv_less_than_bytes,
-    kv_max_bytes, kv_put, kv_put_bytes, kv_remove, kv_remove_bytes, AccountNumber, DbId, KeyView,
-    RawKey, ToKey,
+    get_key_bytes, kv_get, kv_get_bytes, kv_greater_equal_bytes, kv_less_than_bytes, kv_max_bytes,
+    kv_put, kv_put_bytes, kv_remove, kv_remove_bytes, AccountNumber, DbId, KeyView, KvHandle,
+    KvMode, RawKey, ToKey,
 };
-
-// TODO: remove helper
-fn _to_hex(bytes: &[u8]) -> String {
-    let mut result: Vec<u8> = Vec::with_capacity(bytes.len() * 2);
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    for byte in bytes {
-        result.push(DIGITS[(byte >> 4) as usize]);
-        result.push(DIGITS[(byte & 0x0f) as usize]);
-    }
-    String::from_utf8(result).unwrap()
-}
 
 custom_error! {
     #[allow(clippy::enum_variant_names)] pub Error
@@ -32,8 +21,10 @@ custom_error! {
 
 pub trait TableRecord: Pack + UnpackOwned {
     type PrimaryKey: ToKey;
+    const SECONDARY_KEYS: u8;
+    const DB: DbId = DbId::Service;
 
-    fn get_primary_key(&self) -> Self::PrimaryKey;
+    fn get_primary_key(&self) -> RawKey;
 
     /// Return the list of secondary keys.
     ///
@@ -47,24 +38,35 @@ pub trait TableRecord: Pack + UnpackOwned {
 
 pub trait Table<Record: TableRecord>: Sized {
     const TABLE_INDEX: u16;
-    const SECONDARY_KEYS: u8;
+    const SERVICE: AccountNumber;
 
-    fn with_prefix(db_id: DbId, prefix: Vec<u8>) -> Self;
+    fn with_prefix(db_id: DbId, prefix: Vec<u8>, mode: KvMode) -> Self;
     fn prefix(&self) -> &[u8];
-    fn db_id(&self) -> DbId;
+    fn handle(&self) -> &KvHandle;
 
     fn new() -> Self {
-        let prefix = (get_service(), Self::TABLE_INDEX).to_key();
-        Self::create_table_from_prefix(prefix)
+        Self::read_write()
     }
 
-    fn with_service(service: AccountNumber, table_index: u16) -> Self {
-        let prefix = (service, table_index).to_key();
-        Self::create_table_from_prefix(prefix)
+    fn read() -> Self {
+        Self::with_mode(KvMode::Read)
     }
 
-    fn create_table_from_prefix(prefix: Vec<u8>) -> Self {
-        Self::with_prefix(DbId::Service, prefix)
+    fn read_write() -> Self {
+        Self::with_mode(KvMode::ReadWrite)
+    }
+
+    fn with_mode(mode: KvMode) -> Self {
+        Self::with_service_mode(Self::SERVICE, mode)
+    }
+
+    fn with_service(service: AccountNumber) -> Self {
+        Self::with_service_mode(service, KvMode::Read)
+    }
+
+    fn with_service_mode(service: AccountNumber, mode: KvMode) -> Self {
+        let prefix = (service, Self::TABLE_INDEX).to_key();
+        Self::with_prefix(<Record as TableRecord>::DB, prefix, mode)
     }
 
     /// Returns one of the table indexes: 0 = Primary Key Index, else secondary indexes
@@ -72,7 +74,7 @@ pub trait Table<Record: TableRecord>: Sized {
         let mut idx_prefix = self.prefix().to_owned();
         idx.append_key(&mut idx_prefix);
 
-        TableIndex::new(self.db_id(), idx_prefix, idx > 0)
+        TableIndex::new(self.handle(), idx_prefix, idx > 0)
     }
 
     /// Returns the Primary Key Index
@@ -84,14 +86,14 @@ pub trait Table<Record: TableRecord>: Sized {
     fn put(&self, value: &Record) -> Result<(), Error> {
         let pk = self.serialize_key(0, &value.get_primary_key());
         self.handle_secondary_keys_put(&pk.to_key(), value)?;
-        kv_put(self.db_id(), &pk, value);
+        kv_put(self.handle(), &pk, value);
         Ok(())
     }
 
     /// Removes a value from the table
     fn remove(&self, value: &Record) {
         let pk = self.serialize_key(0, &value.get_primary_key());
-        kv_remove(self.db_id(), &pk);
+        kv_remove(self.handle(), &pk);
         self.handle_secondary_keys_removal(value);
     }
 
@@ -100,13 +102,13 @@ pub trait Table<Record: TableRecord>: Sized {
     /// The key must be the primary key. If object has secondary keys, this is
     /// equivalent to looking an object up by the key, then calling [remove] if found.
     fn erase(&self, key: &impl ToKey) {
-        if Self::SECONDARY_KEYS > 0 {
+        if Record::SECONDARY_KEYS > 0 {
             if let Some(record) = self.get_index(0).get(key) {
                 self.remove(&record);
             }
         } else {
             let pk = self.serialize_key(0, key);
-            kv_remove(self.db_id(), &pk);
+            kv_remove(self.handle(), &pk);
         }
     }
 
@@ -118,13 +120,13 @@ pub trait Table<Record: TableRecord>: Sized {
     }
 
     fn handle_secondary_keys_put(&self, pk: &[u8], value: &Record) -> Result<(), Error> {
-        if Self::SECONDARY_KEYS < 1 {
+        if Record::SECONDARY_KEYS < 1 {
             return Ok(());
         }
 
         let secondary_keys = value.get_secondary_keys();
 
-        let old_record: Option<Record> = kv_get(self.db_id(), &KeyView::new(pk)).unwrap();
+        let old_record: Option<Record> = kv_get(self.handle(), &KeyView::new(pk)).unwrap();
 
         if let Some(old_record) = old_record {
             self.replace_secondary_keys(pk, &secondary_keys, old_record)
@@ -134,7 +136,7 @@ pub trait Table<Record: TableRecord>: Sized {
     }
 
     fn handle_secondary_keys_removal(&self, value: &Record) {
-        if Self::SECONDARY_KEYS < 1 {
+        if Record::SECONDARY_KEYS < 1 {
             return;
         }
         let secondary_keys = value.get_secondary_keys();
@@ -196,7 +198,7 @@ pub trait Table<Record: TableRecord>: Sized {
     /// Check if any key already exists in the DB
     fn check_unique_keys<T: AsRef<[u8]>>(&self, keys: &[T]) -> Result<(), Error> {
         for key in keys {
-            if kv_get_bytes(self.db_id(), key.as_ref()).is_some() {
+            if kv_get_bytes(self.handle(), key.as_ref()).is_some() {
                 return Err(Error::DuplicatedKey);
             }
         }
@@ -205,19 +207,29 @@ pub trait Table<Record: TableRecord>: Sized {
 
     fn put_keys_bytes(&self, keys: &Vec<Vec<u8>>, pk: &[u8]) {
         for key in keys {
-            kv_put_bytes(self.db_id(), key, pk);
+            kv_put_bytes(self.handle(), key, pk);
         }
     }
 
     fn remove_keys_bytes(&self, keys: &Vec<Vec<u8>>) {
         for key in keys {
-            kv_remove_bytes(self.db_id(), key);
+            kv_remove_bytes(self.handle(), key);
         }
     }
 }
 
+pub trait ServiceTablesWrapper {
+    const SERVICE: AccountNumber;
+}
+
+pub struct SingletonKey {}
+
+impl ToKey for SingletonKey {
+    fn append_key(&self, _key: &mut Vec<u8>) {}
+}
+
 pub struct TableIndex<Key: ToKey, Record: TableRecord> {
-    pub db_id: DbId,
+    pub db: KvHandle,
     pub prefix: Vec<u8>,
     pub is_secondary: bool,
     pub key_type: PhantomData<Key>,
@@ -226,9 +238,9 @@ pub struct TableIndex<Key: ToKey, Record: TableRecord> {
 
 impl<Key: ToKey, Record: TableRecord> TableIndex<Key, Record> {
     /// Instantiate a new Table Index (Primary or Secondary)
-    fn new(db_id: DbId, prefix: Vec<u8>, is_secondary: bool) -> TableIndex<Key, Record> {
+    pub fn new(db: &KvHandle, prefix: Vec<u8>, is_secondary: bool) -> TableIndex<Key, Record> {
         TableIndex {
-            db_id,
+            db: db.subtree(&[], KvMode::Read),
             prefix,
             is_secondary,
             key_type: PhantomData,
@@ -241,7 +253,7 @@ impl<Key: ToKey, Record: TableRecord> TableIndex<Key, Record> {
         let mut key_bytes = self.prefix.clone();
         key.append_key(&mut key_bytes);
 
-        kv_get_bytes(self.db_id, &key_bytes).and_then(|v| self.get_value_from_bytes(v))
+        kv_get_bytes(&self.db, &key_bytes).and_then(|v| self.get_value_from_bytes(v))
     }
 
     /// Creates an iterator for visiting all the table key-values, in sorted order.
@@ -278,7 +290,7 @@ impl<Key: ToKey, Record: TableRecord> TableIndex<Key, Record> {
         }
         .map(RawKey::new);
         // if front_key.is_some() {
-        //     println!("range2 fc: {}", _to_hex(&front_key.as_ref().unwrap().data));
+        //  println!("range2 fc: {}", Hex(&front_key.as_ref().unwrap().data[..]));
         // }
 
         let mut back_key = self.prefix.clone();
@@ -298,7 +310,7 @@ impl<Key: ToKey, Record: TableRecord> TableIndex<Key, Record> {
         }
         .map(RawKey::new);
         // if back_key.is_some() {
-        //     println!("range2 bc: {}", _to_hex(&back_key.as_ref().unwrap().data));
+        //     println!("range2 bc: {}", Hex(&back_key.as_ref().unwrap().data[..]));
         // }
 
         TableIter {
@@ -311,9 +323,9 @@ impl<Key: ToKey, Record: TableRecord> TableIndex<Key, Record> {
 
     fn get_value_from_bytes(&self, bytes: Vec<u8>) -> Option<Record> {
         if self.is_secondary {
-            kv_get(self.db_id, &RawKey::new(bytes)).unwrap()
+            kv_get(&self.db, &RawKey::new(bytes)).unwrap()
         } else {
-            Some(Record::unpack(&bytes[..], &mut 0).unwrap())
+            Some(Record::unpacked(&bytes[..]).unwrap())
         }
     }
 }
@@ -349,7 +361,7 @@ impl<'a, Key: ToKey, Record: TableRecord> Iterator for TableIter<'a, Key, Record
             .as_ref()
             .map_or(&self.table_index.prefix[..], |k| &k.data[..]);
         let value = kv_greater_equal_bytes(
-            self.table_index.db_id,
+            &self.table_index.db,
             key,
             self.table_index.prefix.len() as u32,
         );
@@ -397,12 +409,12 @@ impl<'a, Key: ToKey, Record: TableRecord> DoubleEndedIterator for TableIter<'a, 
 
         let value = if let Some(back_key) = &self.back_key {
             kv_less_than_bytes(
-                self.table_index.db_id,
+                &self.table_index.db,
                 &back_key.data[..],
                 self.table_index.prefix.len() as u32,
             )
         } else {
-            kv_max_bytes(self.table_index.db_id, &self.table_index.prefix)
+            kv_max_bytes(&self.table_index.db, &self.table_index.prefix)
         };
 
         if let Some(value) = value {
@@ -411,13 +423,13 @@ impl<'a, Key: ToKey, Record: TableRecord> DoubleEndedIterator for TableIter<'a, 
             // if self.front_key.is_some() {
             //     println!(
             //         "iterated from the back bc: {} fc: {}",
-            //         _to_hex(&self.back_key.as_ref().unwrap().data),
-            //         _to_hex(&self.front_key.as_ref().unwrap().data)
+            //         Hex(&self.back_key.as_ref().unwrap().data[..]),
+            //         Hex(&self.front_key.as_ref().unwrap().data[..])
             //     );
             // } else {
             //     println!(
             //         "iterated from the back bc: {} NO FC",
-            //         _to_hex(&self.back_key.as_ref().unwrap().data)
+            //         Hex(&self.back_key.as_ref().unwrap().data[..])
             //     );
             // }
 

@@ -9,17 +9,6 @@ using namespace psibase;
 
 namespace
 {
-
-   std::string_view getComment(std::string_view s)
-   {
-      auto pos = s.find("#");
-      if (pos != std::string::npos)
-      {
-         return s.substr(pos, s.size() - pos - 1);
-      }
-      return "";
-   }
-
    std::string_view enable(std::string_view s)
    {
       auto pos = s.find_first_not_of(" \t\r\n");
@@ -35,88 +24,25 @@ namespace
 
    constexpr std::string_view ws(" \t\r\n");
 
-   std::string maybeQuoteValue(std::string_view s)
+   std::string escape(std::string_view s)
    {
-      if (s.find_first_of("\n\\\"#") == std::string::npos &&
-          (s.empty() ||
-           (ws.find(s.front()) == std::string::npos && ws.find(s.back()) == std::string::npos)))
-      {
-         return std::string(s);
-      }
-      std::string result;
-      result.push_back('"');
+      std::string_view escaped = "\\\"$#";
+      std::string      result;
       for (char ch : s)
       {
          if (ch == '\n')
          {
             result += "\\n";
          }
-         else if (ch == '\"')
-         {
-            result += "\\\"";
-         }
-         else if (ch == '\\')
-         {
-            result += "\\\\";
-         }
          else
          {
+            if (escaped.find(ch) != std::string::npos)
+            {
+               result += '\\';
+            }
             result += ch;
          }
       }
-      result.push_back('"');
-      return result;
-   }
-
-   std::string unquoteValue(std::string_view s, const std::string& filename, std::size_t line)
-   {
-      std::string result;
-      bool        quoted = false;
-      for (std::size_t i = 0; i < s.size(); ++i)
-      {
-         if (s[i] == '"')
-         {
-            quoted = !quoted;
-         }
-         else if (quoted && s[i] == '\\')
-         {
-            ++i;
-            if (i == s.size())
-            {
-               break;
-            }
-            if (s[i] == 'n')
-            {
-               result.push_back('\n');
-            }
-            else
-            {
-               result.push_back(s[i]);
-            }
-         }
-         else
-         {
-            result.push_back(s[i]);
-         }
-      }
-      if (quoted)
-      {
-         throw std::runtime_error(filename + ":" + std::to_string(line) + ": Unterminated \"");
-      }
-      return result;
-   }
-
-   std::string editLine(std::string_view key, std::string_view value, std::string_view comment)
-   {
-      std::string result(key);
-      result += " = ";
-      result += maybeQuoteValue(value);
-      if (!comment.empty())
-      {
-         result += " ";
-         result += comment;
-      }
-      result += "\n";
       return result;
    }
 
@@ -130,6 +56,25 @@ namespace
       {
          return std::string(section) + "." + std::string(key);
       }
+   }
+
+   std::string editLine(const ConfigFileOptions& opts,
+                        std::string_view         section,
+                        std::string_view         key,
+                        std::string_view         value)
+   {
+      std::string result(key);
+      result += " = ";
+      if (opts.expandValue((fullKey(section, key))))
+      {
+         result += escape(value);
+      }
+      else
+      {
+         result += value;
+      }
+      result += "\n";
+      return result;
    }
 
    std::string_view trim(std::string_view s)
@@ -173,21 +118,103 @@ namespace
       return line;
    }
 
-   std::tuple<std::string_view, std::string_view> splitComment(std::string_view line)
+   std::string_view trimComment(std::string_view line)
    {
-      auto commentStart = line.find('#');
-      if (commentStart != std::string::npos)
+      bool        quoted  = false;
+      std::size_t comment = line.size();
+      for (std::size_t i = 0; i < line.size(); ++i)
       {
-         return {line.substr(0, commentStart), line.substr(commentStart)};
+         if (line[i] == '\"')
+         {
+            quoted = !quoted;
+         }
+         else if (line[i] == '\\')
+         {
+            ++i;
+         }
+         else if (!quoted && line[i] == '#')
+         {
+            comment = i;
+            break;
+         }
+      }
+      return trim(line.substr(0, comment));
+   }
+
+   // - removes comments
+   // - removes leading and trailing whitespace
+   // - removes "
+   // - evaluates \ escapes
+   // - expands $VAR
+   std::string expand(std::string_view s)
+   {
+      s = trimComment(s);
+      std::string result;
+      for (std::size_t i = 0; i < s.size(); ++i)
+      {
+         if (s[i] == '"')
+         {
+            continue;
+         }
+         else if (s[i] == '\\')
+         {
+            ++i;
+            if (i == s.size())
+            {
+               break;
+            }
+            if (s[i] == 'n')
+            {
+               result.push_back('\n');
+            }
+            else
+            {
+               result.push_back(s[i]);
+            }
+         }
+         else if (s[i] == '$')
+         {
+            std::string name;
+            for (std::size_t j = i + 1; j < s.size(); ++j)
+            {
+               if (!std::isalnum(s[j]) && s[j] != '_')
+               {
+                  break;
+               }
+               name.push_back(s[j]);
+               i = j;
+            }
+            if (name.empty())
+            {
+               result += '$';
+            }
+            else
+            {
+               if (const char* value = std::getenv(name.c_str()))
+                  result += value;
+            }
+         }
+         else
+         {
+            result.push_back(s[i]);
+         }
+      }
+      return result;
+   }
+
+   std::string eval(const ConfigFileOptions& cfg, std::string_view key, std::string_view value)
+   {
+      if (cfg.expandValue(key))
+      {
+         return expand(value);
       }
       else
       {
-         return {line, ""};
+         return std::string(value);
       }
    }
 
-   std::tuple<std::string_view, std::string_view, std::string_view, bool> parseLine(
-       std::string_view s)
+   std::tuple<std::string_view, std::string_view, bool> parseLine(std::string_view s)
    {
       auto pos     = s.find_first_not_of(ws);
       bool enabled = true;
@@ -226,7 +253,7 @@ namespace
                break;
             }
          }
-         return {trim(k), trim(v.substr(0, comment)), v.substr(comment), enabled};
+         return {trim(k), trim(v), enabled};
       }
    }
 
@@ -260,7 +287,7 @@ void ConfigFile::parse(std::istream& file)
       }
       else
       {
-         auto [key, value, comment, enabled] = parseLine(line);
+         auto [key, value, enabled] = parseLine(line);
          if (!key.empty())
          {
             auto& info = keys[fullKey(section, std::string(key))];
@@ -338,9 +365,12 @@ void ConfigFile::postProcess()
    }
 }
 
-void ConfigFile::write(std::ostream& out)
+void ConfigFile::write(std::ostream& out, bool preserve)
 {
-   postProcess();
+   if (!preserve)
+   {
+      postProcess();
+   }
    for (std::size_t i = 0; i < lines.size(); ++i)
    {
       if (auto iter = insertions.find(i); iter != insertions.end())
@@ -355,6 +385,36 @@ void ConfigFile::write(std::ostream& out)
    {
       out << iter->second;
    }
+}
+
+void ConfigFile::edit(std::size_t location, std::string_view key, std::string_view value)
+{
+   auto [old_key, old_value, enabled] = parseLine(lines[location]);
+   std::string& ins                   = insertions[location + 1];
+   if (!enabled || eval(opts, key, old_value) != value)
+   {
+      // Using old_key instead of key handles the case where a key is
+      // defined outside its regular section
+      if (opts.expandValue(key))
+      {
+         ins = std::string(old_key) + " = " + escape(value) + "\n" + ins;
+      }
+      else
+      {
+         if (value.find('\n') != std::string::npos)
+         {
+            throw std::runtime_error("Cannot handle newline in " + std::string(key));
+         }
+         ins = std::string(old_key) + " = " + std::string(value) + "\n" + ins;
+      }
+   }
+   else
+   {
+      // Preserve the original spelling if the values hasn't changed
+      ins = lines[location] + ins;
+   }
+   // This allows postProcess to know which keys have been updated
+   lines[location].clear();
 }
 
 void ConfigFile::set(std::string_view section,
@@ -373,19 +433,13 @@ void ConfigFile::set(std::string_view section,
          line += comment;
          line += '\n';
       }
-      line += editLine(key, value, "");
+      line += editLine(opts, section, key, value);
    }
    else
    {
       auto location =
           !pos->second.enabled.empty() ? pos->second.enabled.front() : pos->second.disabled.front();
-      auto [old_key, old_value, old_comment, enabled] = parseLine(lines[location]);
-      std::string& ins                                = insertions[location + 1];
-      // Using old_key instead of key handles the case where a key is
-      // defined outside its regular section
-      ins = editLine(old_key, value, old_comment) + ins;
-      // This allows postProcess to know which keys have been updated
-      lines[location].clear();
+      edit(location, key, value);
       sectionInsertPoints[std::string(section)] = location + 1;
    }
 }
@@ -443,7 +497,7 @@ void ConfigFile::set(std::string_view                             section,
       }
       for (auto value : values)
       {
-         line += editLine(key, value, "");
+         line += editLine(opts, section, key, value);
       }
    }
    else
@@ -453,8 +507,8 @@ void ConfigFile::set(std::string_view                             section,
       {
          for (auto loc : *group)
          {
-            auto [key, value, comment, enabled] = parseLine(lines[loc]);
-            locations.try_emplace(normalize(value), loc);
+            auto [key, value, enabled] = parseLine(lines[loc]);
+            locations.try_emplace(normalize(eval(opts, key, value)), loc);
          }
       }
 
@@ -464,15 +518,18 @@ void ConfigFile::set(std::string_view                             section,
          auto iter = locations.find(normalize(value));
          if (iter == locations.end())
          {
-            insertions[insertPoint] += editLine(key, value, "");
+            insertions[insertPoint] += editLine(opts, section, key, value);
+         }
+         else if (lines[iter->second].empty())
+         {
+            // Multiple values for the same key. Make sure that they appear in order
+            insertPoint = iter->second + 1;
+            insertions[insertPoint] += editLine(opts, section, key, value);
          }
          else
          {
-            auto location                                   = iter->second;
-            auto [old_key, old_value, old_comment, enabled] = parseLine(lines[location]);
-            std::string& ins                                = insertions[location + 1];
-            ins = editLine(old_key, value, old_comment) + ins;
-            lines[location].clear();
+            auto location = iter->second;
+            edit(location, key, value);
             insertPoint = location + 1;
          }
       }
@@ -487,6 +544,7 @@ void ConfigFile::set(std::string_view                             section,
 boost::program_options::parsed_options psibase::parse_config_file(
     std::istream&                                      file,
     const boost::program_options::options_description& opts,
+    const ConfigFileOptions&                           cfg,
     const std::string&                                 filename)
 {
    boost::program_options::parsed_options result{&opts};
@@ -539,17 +597,18 @@ boost::program_options::parsed_options psibase::parse_config_file(
       }
       else
       {
-         auto [key, value, comment, enabled] = parseLine(line);
+         auto [key, value, enabled] = parseLine(line);
          if (enabled)
          {
-            auto k = fullKey(section, key);
-            if (!allowedOption(k))
+            auto                           k = fullKey(section, key);
+            boost::program_options::option opt{k, {eval(cfg, k, value)}};
+            opt.original_tokens = {k, std::string(value)};
+            opt.unregistered    = !allowedOption(k);
+            if (opt.unregistered && !cfg.allowUnregistered)
             {
                throw std::runtime_error(filename + ":" + std::to_string(line_number) +
                                         ": Unknown option " + k);
             }
-            boost::program_options::option opt{k, {unquoteValue(value, filename, line_number)}};
-            opt.original_tokens = {k, std::string(value)};
             result.options.push_back(std::move(opt));
          }
       }

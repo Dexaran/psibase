@@ -1,0 +1,8 @@
+package producers:plugin;
+
+world impl {
+    include transact:plugin/imports;
+    include host:common/imports;
+
+    export api;
+}

@@ -2,8 +2,7 @@
 
 #include <boost/asio/io_context.hpp>
 
-#define CATCH_CONFIG_MAIN
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 using namespace psibase::test;
 
@@ -15,12 +14,10 @@ TEST_CASE("mock_timer")
    using namespace std::literals::chrono_literals;
    timer.expires_after(1s);
    timer.async_wait([&](std::error_code) { ++counter; });
-   ctx.run();
-   ctx.restart();
+   ctx.poll();
    CHECK(counter == 0);
-   mock_clock::advance(1s);
+   mock_clock::advance(mock_clock::now() + 1s);
    CHECK(counter == 0);
-   ctx.run();
-   ctx.restart();
+   ctx.poll();
    CHECK(counter == 1);
 }

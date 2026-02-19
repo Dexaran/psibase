@@ -1,0 +1,33 @@
+[package]
+name = "example"
+description = "Test contract #2"
+version.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.psibase]
+package-name = "TestContract2"
+# flags = []
+server = "example"
+
+[package.metadata.psibase.dependencies]
+HttpServer = "0.23.0"
+Events = "0.23.0"
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[dependencies]
+psibase_macros.workspace = true
+psibase.workspace = true
+psibase-rust-workspace-hack.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-graphql.workspace = true
+serde-aux.workspace = true

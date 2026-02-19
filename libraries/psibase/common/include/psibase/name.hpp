@@ -24,7 +24,7 @@ THE SOFTWARE.
  This code was derived from code written to illustrate the article:
  Data Compression With Arithmetic Coding
  by Mark Nelson
- published at: http://marknelson.us/2014/10/19/data-compression-with-arithmetic-coding
+ published at: https://marknelson.us/posts/2014/10/19/data-compression-with-arithmetic-coding.html
 
  It has been modified by Daniel Larimer for the specific purpose of compressing
  short names and the encoder has been updated to use precomputed tables that change
@@ -502,9 +502,8 @@ namespace psibase
       constexpr account_id_type(uint64_t n = 0) : value(n) {}
 
       uint64_t value = 0;
-               operator std::string() const { return number_to_name(value); }
+      operator std::string() const { return number_to_name(value); }
+      PSIO_REFLECT(account_id_type, value);
    };
-
-   PSIO_REFLECT(account_id_type, value);
 
 }  // namespace psibase

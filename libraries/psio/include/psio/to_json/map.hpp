@@ -1,11 +1,11 @@
 #pragma once
-#include <psio/to_json.hpp>
 #include <map>
+#include <psio/to_json.hpp>
 
 namespace psio
 {
-   template <typename K, typename T, typename S>
-   void to_json(const std::map<K, T>& m, S& stream)
+   template <typename K, typename T, typename C, typename S>
+   void to_json(const std::map<K, T, C>& m, S& stream)
    {
       stream.write('{');
       if (m.size() == 0)

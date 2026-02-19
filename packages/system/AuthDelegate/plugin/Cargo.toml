@@ -1,0 +1,26 @@
+[package]
+name = "auth-delegate"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wit-bindgen-rt.workspace = true
+psibase.workspace = true
+psibase-plugin-workspace-hack.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "auth-delegate:plugin"
+
+[package.metadata.component.target]
+world = "impl"
+
+[package.metadata.component.dependencies]
+
+[package.metadata.component.target.dependencies]
+"host:common" = { path = "../../../user/Host/plugin/common/wit/world.wit" }
+"host:types" = { path = "../../../user/Host/plugin/types/wit/world.wit" }
+"transact:plugin" = { path = "../../Transact/plugin/wit/world.wit" }
+"permissions:plugin" = { path = "../../../user/Permissions/plugin/wit/world.wit" }

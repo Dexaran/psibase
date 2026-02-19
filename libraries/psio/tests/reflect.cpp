@@ -22,7 +22,7 @@ struct sync_call_proxy
    uint32_t sender;
    uint32_t receiver;
 
-   template <uint32_t idx, uint64_t Name, auto MemberPtr, typename... Args>
+   template <uint32_t idx, auto MemberPtr, typename... Args>
    auto call(Args&&... args) const
    {
       std::cout << "call sender: " << sender << "  receiver: " << receiver << "\n";
@@ -31,7 +31,7 @@ struct sync_call_proxy
       using member_class = decltype(psio::class_of_member(MemberPtr));
       using param_tuple  = decltype(psio::tuple_remove_view(psio::args_as_tuple(MemberPtr)));
       using arg_var      = decltype(psio::tuple_to_variant(
-               psio::get_tuple_args(psio::reflect<member_class>::member_pointers())));
+          psio::get_tuple_args(psio::reflect<member_class>::member_pointers())));
 
       /// construct tuple from args as defined by MemberPtr and constructed from args
       /// serialize... dispatch... read result as shared_view_ptr<>

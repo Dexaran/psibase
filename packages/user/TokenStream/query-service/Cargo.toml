@@ -1,0 +1,16 @@
+[package]
+name = "r-token-stream"
+description = "RPC service for token-stream"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+psibase.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+token-stream = { path = "../service", version = "0.23.0" }
+async-graphql = { version = "7.0.10" }
+serde-aux.workspace = true
+psibase-user-workspace-hack.workspace = true

@@ -1,0 +1,102 @@
+#include <psibase/Table.hpp>
+#include <psibase/dispatch.hpp>
+#include <psibase/nativeTables.hpp>
+#include <psibase/serveGraphQL.hpp>
+#include <psibase/servePackAction.hpp>
+#include <psibase/serveSimpleUI.hpp>
+#include <services/system/Producers.hpp>
+#include <services/system/RProducers.hpp>
+
+#include <utility>
+
+using namespace SystemService;
+using namespace psibase;
+
+struct ProducerQuery
+{
+   std::vector<CandidateInfo> candidatesInfo(std::vector<AccountNumber> names) const
+   {
+      auto table = Producers::Tables{Producers::service, KvMode::read}.open<CandidateInfoTable>();
+
+      std::vector<CandidateInfo> infos;
+      for (const auto& name : names)
+      {
+         auto info = table.get(name);
+         if (info)
+            infos.push_back(*info);
+      }
+      return infos;
+   }
+
+   auto allCandidates() const
+   {
+      return Producers::Tables{Producers::service, KvMode::read}
+          .open<CandidateInfoTable>()
+          .getIndex<0>();
+   }
+
+   std::vector<Producer> producers() const
+   {
+      return std::visit([](const auto& c) { return c.producers; }, consensus());
+   }
+   std::vector<Producer> nextProducers() const
+   {
+      if (auto c = nextConsensus())
+         return std::visit([](const auto& c) { return c.producers; }, *c);
+      return {};
+   }
+   ConsensusData consensus() const
+   {
+      const auto& status = getOptionalStatus();
+      if (!status)
+         return {};
+      return std::move(status->consensus.current.data);
+   }
+   std::optional<ConsensusData> nextConsensus() const
+   {
+      const auto& status = getOptionalStatus();
+      if (!status || !status->consensus.next)
+         return {};
+      return std::move(status->consensus.next->consensus.data);
+   }
+   std::optional<BlockNum> jointStart() const
+   {
+      const auto& status = getOptionalStatus();
+      if (!status || !status->consensus.next)
+         return {};
+      return status->consensus.next->blockNum;
+   }
+
+   uint8_t maxProds() const
+   {
+      auto table  = Producers::Tables{Producers::service, KvMode::read}.open<ProdsConfigTable>();
+      auto config = table.get({});
+      if (!config)
+         return Producers::DEFAULT_MAX_PRODS;
+      return config->maxProds;
+   }
+};
+PSIO_REFLECT(ProducerQuery,
+             method(candidatesInfo, names),
+             method(allCandidates),
+             method(producers),
+             method(nextProducers),
+             method(consensus),
+             method(nextConsensus),
+             method(jointStart))
+
+std::optional<HttpReply> RProducers::serveSys(HttpRequest request)
+{
+   if (auto result = servePackAction<Producers>(request))
+      return result;
+
+   if (auto result = serveGraphQL(request, ProducerQuery{}))
+      return result;
+
+   if (auto result = serveSimpleUI<Producers, false>(request))
+      return result;
+
+   return {};
+}
+
+PSIBASE_DISPATCH(SystemService::RProducers)

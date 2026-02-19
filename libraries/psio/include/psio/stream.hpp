@@ -1,7 +1,7 @@
 #pragma once
 
-#include <string.h>
 #include <algorithm>
+#include <cstring>
 #include <psio/check.hpp>
 #include <span>
 #include <string>
@@ -95,17 +95,32 @@ namespace psio
          data.insert(data.end(), s, s + size);
       }
 
+      void rewrite(size_t offset, const void* src, size_t size)
+      {
+         std::memcpy(data.data() + offset, src, size);
+      }
+
       template <typename T>
       void write_raw(const T& v)
       {
          write(&v, sizeof(v));
       }
+
+      template <typename T>
+      void rewrite_raw(size_t offset, const T& v)
+      {
+         rewrite(offset, &v, sizeof(v));
+      }
+
+      size_t written() const { return data.size(); }
    };
 
    struct vector_stream
    {
       std::vector<char>& data;
       vector_stream(std::vector<char>& data) : data(data) {}
+
+      void about_to_write(size_t amount) { data.reserve(data.size() + amount); }
 
       void write(char ch) { data.push_back(ch); }
 
@@ -115,11 +130,24 @@ namespace psio
          data.insert(data.end(), s, s + size);
       }
 
+      void rewrite(size_t offset, const void* src, size_t size)
+      {
+         std::memcpy(data.data() + offset, src, size);
+      }
+
       template <typename T>
       void write_raw(const T& v)
       {
          write(&v, sizeof(v));
       }
+
+      template <typename T>
+      void rewrite_raw(size_t offset, const T& v)
+      {
+         rewrite(offset, &v, sizeof(v));
+      }
+
+      size_t written() const { return data.size(); }
    };
 
    struct fixed_buf_stream
@@ -129,6 +157,8 @@ namespace psio
       char* end;
 
       fixed_buf_stream(char* pos, size_t size) : begin(pos), pos{pos}, end{pos + size} {}
+
+      void about_to_write(size_t amount) {}
 
       void write(char ch)
       {
@@ -141,14 +171,25 @@ namespace psio
       {
          if (pos + size > end)
             abort_error(stream_error::overrun);
-         memcpy(pos, src, size);
+         std::memcpy(pos, src, size);
          pos += size;
+      }
+
+      void rewrite(size_t offset, const void* src, size_t size)
+      {
+         std::memcpy(begin + offset, src, size);
       }
 
       template <typename T>
       void write_raw(const T& v)
       {
          write(&v, sizeof(v));
+      }
+
+      template <typename T>
+      void rewrite_raw(size_t offset, const T& v)
+      {
+         rewrite(offset, &v, sizeof(v));
       }
 
       void skip(int32_t s)
@@ -160,6 +201,7 @@ namespace psio
 
       size_t remaining() const { return end - pos; }
       size_t consumed() const { return pos - begin; }
+      size_t written() const { return pos - begin; }
    };
 
    /**
@@ -171,14 +213,21 @@ namespace psio
       char* pos;
       char* end;
 
+      void about_to_write(size_t amount) {}
+
       fast_buf_stream(char* pos, size_t size) : begin(pos), pos{pos}, end{pos + size} {}
 
       void write(char ch) { *pos++ = ch; }
 
       void write(const void* src, size_t size)
       {
-         memcpy(pos, src, size);
+         std::memcpy(pos, src, size);
          pos += size;
+      }
+
+      void rewrite(size_t offset, const void* src, size_t size)
+      {
+         std::memcpy(begin + offset, src, size);
       }
 
       template <typename T>
@@ -187,18 +236,29 @@ namespace psio
          write(&v, sizeof(v));
       }
 
+      template <typename T>
+      void rewrite_raw(size_t offset, const T& v)
+      {
+         rewrite(offset, &v, sizeof(v));
+      }
+
       void skip(int32_t s) { pos += s; }
 
       size_t remaining() const { return end - pos; }
       size_t consumed() const { return pos - begin; }
+      size_t written() const { return pos - begin; }
    };
 
    struct size_stream
    {
       size_t size = 0;
 
+      void about_to_write(size_t amount) {}
+
       void write(char ch) { ++size; }
       void write(const void* src, size_t size) { this->size += size; }
+
+      void rewrite(size_t offset, const void* src, size_t size) {}
 
       template <typename T>
       void write_raw(const T& v)
@@ -206,7 +266,13 @@ namespace psio
          size += sizeof(v);
       }
 
-      void skip(int32_t s) { size += s; }
+      template <typename T>
+      void rewrite_raw(size_t offset, const T& v)
+      {
+      }
+
+      void   skip(int32_t s) { size += s; }
+      size_t written() const { return size; }
    };
 
    template <typename S>
@@ -299,7 +365,7 @@ namespace psio
       {
          if (size > size_t(end - pos))
             abort_error(stream_error::overrun);
-         memcpy(dest, pos, size);
+         std::memcpy(dest, pos, size);
          pos += size;
       }
 
@@ -323,6 +389,8 @@ namespace psio
          result = pos;
          pos += size;
       }
+
+      operator std::span<const char>() const { return {pos, end}; }
    };
 
    struct check_input_stream
@@ -377,7 +445,7 @@ namespace psio
       {
          if (size > size_t(end - pos))
             abort_error(stream_error::overrun);
-         memcpy(dest, pos, size);
+         std::memcpy(dest, pos, size);
          pos += size;
       }
 

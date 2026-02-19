@@ -7,7 +7,10 @@
 //!
 //! These functions wrap the [Raw Native Functions](crate::native_raw).
 
-use crate::{native_raw, AccountNumber, DbId, ToKey};
+use crate::{
+    native_raw, AccountNumber, DbId, HttpRequest, MicroSeconds, SocketEndpoint, TLSInfo, ToKey,
+};
+use anyhow::anyhow;
 use fracpack::{Pack, Unpack, UnpackOwned};
 
 /// Write message to console
@@ -124,7 +127,7 @@ pub fn get_current_action_bytes() -> Vec<u8> {
 /// Note: The above only applies if the contract uses [crate::native_raw::call].
 pub fn get_current_action() -> crate::Action {
     let bytes = get_current_action_bytes();
-    <crate::Action>::unpack(&bytes[..], &mut 0).unwrap() // unwrap won't panic
+    <crate::Action>::unpacked(&bytes[..]).unwrap() // unwrap won't panic
 }
 
 /// Get the currently-executing action and pass it to `f`.
@@ -140,7 +143,7 @@ pub fn get_current_action() -> crate::Action {
 /// Note: The above only applies if the contract uses [crate::native_raw::call].
 pub fn with_current_action<R, F: Fn(crate::SharedAction) -> R>(f: F) -> R {
     let bytes = get_current_action_bytes();
-    let act = <crate::SharedAction>::unpack(&bytes[..], &mut 0).unwrap(); // unwrap won't panic
+    let act = <crate::SharedAction>::unpacked(&bytes[..]).unwrap(); // unwrap won't panic
     f(act)
 }
 
@@ -150,7 +153,7 @@ pub fn set_retval<T: Pack>(val: &T) {
     unsafe { native_raw::setRetval(bytes.as_ptr(), bytes.len() as u32) };
 }
 
-fn get_optional_result_bytes(size: u32) -> Option<Vec<u8>> {
+pub fn get_optional_result_bytes(size: u32) -> Option<Vec<u8>> {
     if size < u32::MAX {
         Some(get_result_bytes(size))
     } else {
@@ -158,13 +161,51 @@ fn get_optional_result_bytes(size: u32) -> Option<Vec<u8>> {
     }
 }
 
+#[derive(Debug)]
+pub struct KvHandle(native_raw::KvHandle);
+
+pub use native_raw::KvMode;
+
+impl KvHandle {
+    pub fn new(db: DbId, prefix: &[u8], mode: KvMode) -> KvHandle {
+        match db {
+            DbId::Service | DbId::WriteOnly | DbId::BlockLog | DbId::Native => Self::import(
+                crate::services::db::Wrapper::call().open(db, prefix.to_vec().into(), mode as u8),
+            ),
+            DbId::Subjective | DbId::Session | DbId::Temporary => Self::import(
+                crate::services::x_db::Wrapper::call().open(db, prefix.to_vec().into(), mode as u8),
+            ),
+            _ => KvHandle(unsafe {
+                native_raw::kvOpen(db, prefix.as_ptr(), prefix.len() as u32, mode)
+            }),
+        }
+    }
+    pub fn subtree(&self, prefix: &[u8], mode: KvMode) -> KvHandle {
+        KvHandle(unsafe {
+            native_raw::kvOpenAt(self.0, prefix.as_ptr(), prefix.len() as u32, mode)
+        })
+    }
+    pub fn import(index: u32) -> KvHandle {
+        let handles =
+            Vec::<u32>::unpacked(&get_result_bytes(unsafe { native_raw::importHandles() }))
+                .unwrap();
+        KvHandle(native_raw::KvHandle(handles[index as usize]))
+    }
+}
+
+impl Drop for KvHandle {
+    fn drop(&mut self) {
+        unsafe { native_raw::kvClose(self.0) }
+    }
+}
+
 /// Set a key-value pair
 ///
 /// If key already exists, then replace the existing value.
-pub fn kv_put_bytes(db: DbId, key: &[u8], value: &[u8]) {
+pub fn kv_put_bytes(db: &KvHandle, key: &[u8], value: &[u8]) {
     unsafe {
         native_raw::kvPut(
-            db,
+            db.0,
             key.as_ptr(),
             key.len() as u32,
             value.as_ptr(),
@@ -176,7 +217,7 @@ pub fn kv_put_bytes(db: DbId, key: &[u8], value: &[u8]) {
 /// Set a key-value pair
 ///
 /// If key already exists, then replace the existing value.
-pub fn kv_put<K: ToKey, V: Pack>(db: DbId, key: &K, value: &V) {
+pub fn kv_put<K: ToKey, V: Pack>(db: &KvHandle, key: &K, value: &V) {
     kv_put_bytes(db, &key.to_key(), &value.packed())
 }
 
@@ -196,31 +237,30 @@ pub fn put_sequential<Type: Pack, V: Pack>(
     ty: &Type,
     value: &V,
 ) -> u64 {
-    let mut packed = Vec::new();
-    service.pack(&mut packed);
-    ty.pack(&mut packed);
-    value.pack(&mut packed);
-    put_sequential_bytes(db, &packed)
+    put_sequential_bytes(db, &(service, Some(ty), Some(value)).packed())
 }
 
 /// Remove a key-value pair if it exists
-pub fn kv_remove_bytes(db: DbId, key: &[u8]) {
-    unsafe { native_raw::kvRemove(db, key.as_ptr(), key.len() as u32) }
+pub fn kv_remove_bytes(db: &KvHandle, key: &[u8]) {
+    unsafe { native_raw::kvRemove(db.0, key.as_ptr(), key.len() as u32) }
 }
 
 /// Remove a key-value pair if it exists
-pub fn kv_remove<K: ToKey>(db: DbId, key: &K) {
+pub fn kv_remove<K: ToKey>(db: &KvHandle, key: &K) {
     kv_remove_bytes(db, &key.to_key())
 }
 
 /// Get a key-value pair, if any
-pub fn kv_get_bytes(db: DbId, key: &[u8]) -> Option<Vec<u8>> {
-    let size = unsafe { native_raw::kvGet(db, key.as_ptr(), key.len() as u32) };
+pub fn kv_get_bytes(db: &KvHandle, key: &[u8]) -> Option<Vec<u8>> {
+    let size = unsafe { native_raw::kvGet(db.0, key.as_ptr(), key.len() as u32) };
     get_optional_result_bytes(size)
 }
 
 /// Get a key-value pair, if any
-pub fn kv_get<V: UnpackOwned, K: ToKey>(db: DbId, key: &K) -> Result<Option<V>, fracpack::Error> {
+pub fn kv_get<V: UnpackOwned, K: ToKey>(
+    db: &KvHandle,
+    key: &K,
+) -> Result<Option<V>, fracpack::Error> {
     if let Some(v) = kv_get_bytes(db, &key.to_key()) {
         Ok(Some(V::unpacked(&v)?))
     } else {
@@ -234,9 +274,9 @@ pub fn kv_get<V: UnpackOwned, K: ToKey>(db: DbId, key: &K) -> Result<Option<V>, 
 /// If one is found, and the first `match_key_size` bytes of the found key
 /// matches the provided key, then returns the value. Use [get_key_bytes] to get
 /// the found key.
-pub fn kv_greater_equal_bytes(db: DbId, key: &[u8], match_key_size: u32) -> Option<Vec<u8>> {
+pub fn kv_greater_equal_bytes(db: &KvHandle, key: &[u8], match_key_size: u32) -> Option<Vec<u8>> {
     let size =
-        unsafe { native_raw::kvGreaterEqual(db, key.as_ptr(), key.len() as u32, match_key_size) };
+        unsafe { native_raw::kvGreaterEqual(db.0, key.as_ptr(), key.len() as u32, match_key_size) };
     get_optional_result_bytes(size)
 }
 
@@ -247,12 +287,12 @@ pub fn kv_greater_equal_bytes(db: DbId, key: &[u8], match_key_size: u32) -> Opti
 /// matches the provided key, then returns the value. Use [get_key_bytes] to get
 /// the found key.
 pub fn kv_greater_equal<K: ToKey, V: UnpackOwned>(
-    db_id: DbId,
+    db: &KvHandle,
     key: &K,
     match_key_size: u32,
 ) -> Option<V> {
-    let bytes = kv_greater_equal_bytes(db_id, &key.to_key(), match_key_size);
-    bytes.map(|v| V::unpack(&v[..], &mut 0).unwrap())
+    let bytes = kv_greater_equal_bytes(db, &key.to_key(), match_key_size);
+    bytes.map(|v| V::unpacked(&v[..]).unwrap())
 }
 
 /// Get the key-value pair immediately-before provided key
@@ -260,9 +300,9 @@ pub fn kv_greater_equal<K: ToKey, V: UnpackOwned>(
 /// If one is found, and the first `match_key_size` bytes of the found key
 /// matches the provided key, then returns the value. Use [get_key_bytes] to get
 /// the found key.
-pub fn kv_less_than_bytes(db: DbId, key: &[u8], match_key_size: u32) -> Option<Vec<u8>> {
+pub fn kv_less_than_bytes(db: &KvHandle, key: &[u8], match_key_size: u32) -> Option<Vec<u8>> {
     let size =
-        unsafe { native_raw::kvLessThan(db, key.as_ptr(), key.len() as u32, match_key_size) };
+        unsafe { native_raw::kvLessThan(db.0, key.as_ptr(), key.len() as u32, match_key_size) };
     get_optional_result_bytes(size)
 }
 
@@ -272,26 +312,123 @@ pub fn kv_less_than_bytes(db: DbId, key: &[u8], match_key_size: u32) -> Option<V
 /// matches the provided key, then returns the value. Use [get_key_bytes] to get
 /// the found key.
 pub fn kv_less_than<K: ToKey, V: UnpackOwned>(
-    db_id: DbId,
+    db: &KvHandle,
     key: &K,
     match_key_size: u32,
 ) -> Option<V> {
-    let bytes = kv_less_than_bytes(db_id, &key.to_key(), match_key_size);
-    bytes.map(|v| V::unpack(&v[..], &mut 0).unwrap())
+    let bytes = kv_less_than_bytes(db, &key.to_key(), match_key_size);
+    bytes.map(|v| V::unpacked(&v[..]).unwrap())
 }
 
 /// Get the maximum key-value pair which has key as a prefix
 ///
 /// If one is found, then returns the value. Use [get_key_bytes] to get the found key.
-pub fn kv_max_bytes(db: DbId, key: &[u8]) -> Option<Vec<u8>> {
-    let size = unsafe { native_raw::kvMax(db, key.as_ptr(), key.len() as u32) };
+pub fn kv_max_bytes(db: &KvHandle, key: &[u8]) -> Option<Vec<u8>> {
+    let size = unsafe { native_raw::kvMax(db.0, key.as_ptr(), key.len() as u32) };
     get_optional_result_bytes(size)
 }
 
 /// Get the maximum key-value pair which has key as a prefix
 ///
 /// If one is found, then returns the value. Use [get_key_bytes] to get the found key.
-pub fn kv_max<K: ToKey, V: UnpackOwned>(db_id: DbId, key: &K) -> Option<V> {
-    let bytes = kv_max_bytes(db_id, &key.to_key());
-    bytes.map(|v| V::unpack(&v[..], &mut 0).unwrap())
+pub fn kv_max<K: ToKey, V: UnpackOwned>(db: &KvHandle, key: &K) -> Option<V> {
+    let bytes = kv_max_bytes(db, &key.to_key());
+    bytes.map(|v| V::unpacked(&v[..]).unwrap())
+}
+
+pub fn get_sequential_bytes(db_id: DbId, id: u64) -> Option<Vec<u8>> {
+    let size = unsafe { native_raw::getSequential(db_id, id) };
+    get_optional_result_bytes(size)
+}
+
+/// Sets the CPU timer to expire after the current transaction/query/callback
+/// context has run for a given time. When the timer
+/// expires, the current context will be terminated. Setting the timeout
+/// replaces any previous timeout.
+pub fn set_max_cpu_time<T: Into<MicroSeconds>>(time: T) {
+    let time: MicroSeconds = time.into();
+    let time = (time.value * 1000) as u64;
+    unsafe { native_raw::setMaxCpuTime(time) }
+}
+
+pub use scopeguard;
+
+pub fn checkout_subjective() {
+    unsafe { native_raw::checkoutSubjective() }
+}
+
+pub fn commit_subjective() -> bool {
+    unsafe { native_raw::commitSubjective() }
+}
+
+pub fn abort_subjective() {
+    unsafe { native_raw::abortSubjective() }
+}
+
+/// The `subjective_tx` macro creates a scope in which
+/// the subjective database is accessible. It is necessary to use
+/// this scope for any reads or writes to the subjective database.
+///
+/// The statement will be executed one or more times until
+/// it is successfully committed.
+///
+/// Unstructured control flow that exits the statement, (e.g. break,
+/// return, panic), will discard any changes made to the
+/// subjective database.
+#[macro_export]
+macro_rules! subjective_tx {
+    {$($stmt:tt)*} => {
+        $crate::native::checkout_subjective();
+        #[allow(unreachable_code)]
+        let r = loop {
+            let mut guard = $crate::native::scopeguard::guard((), |_|{
+                $crate::native::abort_subjective();
+            });
+            let result = { $($stmt)* };
+            $crate::native::scopeguard::ScopeGuard::into_inner(guard);
+            if $crate::native::commit_subjective() {
+                break result;
+            }
+        };
+        r
+    }
+}
+
+/// Starts a new HTTP request and returns the socket
+pub fn socket_open(
+    req: HttpRequest,
+    tls: Option<TLSInfo>,
+    endpoint: Option<SocketEndpoint>,
+) -> Result<i32, anyhow::Error> {
+    let packed = (req, tls, endpoint).packed();
+    let sock = unsafe { native_raw::socketOpen(packed.as_ptr(), packed.len()) };
+    if sock >= 0 {
+        Ok(sock)
+    } else {
+        Err(anyhow!("socket_open: {}", -sock))
+    }
+}
+
+/// Send a message to a socket
+pub fn socket_send(fd: i32, data: &[u8]) -> Result<(), anyhow::Error> {
+    let err = unsafe { native_raw::socketSend(fd, data.as_ptr(), data.len()) };
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!("socket_send: {}", err))
+    }
+}
+
+/// Change flags on a socket. The mask determines which flags are set.
+///
+/// If this function is called within a subjectiveCheckout, it will only take
+/// effect if the top-level commit succeeds. If another context changes the
+/// flags, subjectiveCommit may fail.
+pub fn socket_set_flags(fd: i32, mask: u32, value: u32) -> Result<(), anyhow::Error> {
+    let err = unsafe { native_raw::socketSetFlags(fd, mask, value) };
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(anyhow!("socket_set_flags: {}", err))
+    }
 }

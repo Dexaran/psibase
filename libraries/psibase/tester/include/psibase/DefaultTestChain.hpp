@@ -1,6 +1,8 @@
 #pragma once
 
 #include <psibase/tester.hpp>
+#include <services/system/Accounts.hpp>
+#include <services/system/AuthSig.hpp>
 
 namespace psibase
 {
@@ -10,39 +12,56 @@ namespace psibase
    class DefaultTestChain : public TestChain
    {
      public:
-      DefaultTestChain(
-          const std::vector<std::pair<AccountNumber, const char*>>& additionalServices = {},
-          uint64_t                                                  max_objects        = 1'000'000,
-          uint64_t                                                  hot_addr_bits      = 27,
-          uint64_t                                                  warm_addr_bits     = 27,
-          uint64_t                                                  cool_addr_bits     = 27,
-          uint64_t                                                  cold_addr_bits     = 27);
-
-      void deploySystemServices(bool show = false);
-
-      void setBlockProducers(bool show = false);
-
-      void createSysServiceAccounts(bool show = false);
+      // default excludes Docs and TokenUsers
+      static std::vector<std::string> defaultPackages();
+      DefaultTestChain();
+      DefaultTestChain(const std::vector<std::string>& packageNames,
+                       bool                            installUI = false,
+                       const DatabaseConfig&           dbconfig  = {},
+                       bool                            pub       = true);
 
       AccountNumber addService(const char* acc, const char* filename, bool show = false);
-
       AccountNumber addService(AccountNumber acc, const char* filename, bool show = false);
+      AccountNumber addService(AccountNumber acc,
+                               const char*   filename,
+                               std::uint64_t flags,
+                               bool          show = false);
+      template <typename Service>
+      auto addService(const char* filename, bool show = false)
+      {
+         if constexpr (requires { Service::serviceFlags; })
+         {
+            return addService(Service::service, filename, Service::serviceFlags, show);
+         }
+         else
+         {
+            return addService(Service::service, filename, show);
+         }
+      }
 
-      AccountNumber add_ec_account(const char*      name,
-                                   const PublicKey& public_key,
-                                   bool             show = false);
+      template <typename AuthService>
+      void setAuth(AccountNumber name, const auto& pubkey)
+      {
+         auto n  = name.str();
+         auto t1 = this->from(name).to<AuthService>().setKey(pubkey);
+         check(psibase::show(false, t1.trace()) == "", "Failed to setkey for " + n);
+         auto t2 = this->from(name).to<SystemService::Accounts>().setAuthServ(AuthService::service);
+         check(psibase::show(false, t2.trace()) == "", "Failed to setAuthServ for " + n);
+      }
 
-      AccountNumber add_ec_account(AccountNumber    name,
-                                   const PublicKey& public_key,
-                                   bool             show = false);
+      AccountNumber addAccount(const char*                                         name,
+                               const SystemService::AuthSig::SubjectPublicKeyInfo& public_key,
+                               bool                                                show = false);
+      AccountNumber addAccount(AccountNumber                                       name,
+                               const SystemService::AuthSig::SubjectPublicKeyInfo& public_key,
+                               bool                                                show = false);
 
-      AccountNumber add_account(const char*   acc,
-                                AccountNumber authService = AccountNumber("auth-any-sys"),
-                                bool          show        = false);
+      AccountNumber addAccount(const char*   acc,
+                               AccountNumber authService = AccountNumber("auth-any"),
+                               bool          show        = false);
 
-      AccountNumber add_account(AccountNumber acc,
-                                AccountNumber authService = AccountNumber("auth-any-sys"),
-                                bool          show        = false);
-      void          registerSysRpc();
+      AccountNumber addAccount(AccountNumber acc,
+                               AccountNumber authService = AccountNumber("auth-any"),
+                               bool          show        = false);
    };
 }  // namespace psibase

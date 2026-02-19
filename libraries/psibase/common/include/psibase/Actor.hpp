@@ -1,10 +1,12 @@
 #pragma once
+#include <psibase/api.hpp>
 #include <psibase/block.hpp>
 #include <psibase/check.hpp>
 #include <psibase/db.hpp>
-#include <psibase/nativeFunctions.hpp>
+#include <psibase/export.hpp>
 #include <psibase/serviceState.hpp>
 #include <psio/fracpack.hpp>
+#include <psio/nested.hpp>
 
 namespace psibase
 {
@@ -30,84 +32,180 @@ namespace psibase
       AccountNumber sender;
       AccountNumber receiver;
 
-      // TODO: remove idx (unused)
-      template <uint32_t idx, uint64_t Name, auto MemberPtr, typename... Args>
+      template <uint32_t idx, auto MemberPtr, typename... Args>
       auto call(Args&&... args) const
       {
          using member_class = decltype(psio::class_of_member(MemberPtr));
-         using param_tuple  = decltype(psio::tuple_remove_view(psio::args_as_tuple(MemberPtr)));
+         using param_tuple  = typename psio::make_param_value_tuple<decltype(MemberPtr)>::type;
 
          static_assert(std::tuple_size<param_tuple>() <= sizeof...(Args),
                        "too few arguments passed to method");
          static_assert(std::tuple_size<param_tuple>() == sizeof...(Args),
                        "too many arguments passed to method");
 
-         return psibase::Action{sender, receiver, MethodNumber(Name),
-                                psio::convert_to_frac(param_tuple(std::forward<Args>(args)...))};
+         return psibase::Action{
+             sender, receiver,
+             MethodNumber(*psio::reflect<member_class>::member_function_names[idx].begin()),
+             psio::convert_to_frac(param_tuple(std::forward<Args>(args)...))};
       }
    };
 
    template <typename T>
-   psio::shared_view_ptr<T> fraccall(const Action& a)
+   struct ImportView
    {
-      auto packed_action = psio::convert_to_frac(a);  /// TODO: avoid double copy of action data
-      auto result_size   = raw::call(packed_action.data(), packed_action.size());
-      if constexpr (not std::is_same_v<void, T>)
+      psio::shared_view_ptr<exportType<T>>         raw;
+      psio::shared_view_ptr<std::vector<KvHandle>> handles;
+      T unpack() const { return psibaseImport((T*)nullptr, *raw, *handles); }
+   };
+
+   template <typename R>
+   auto fraccall(std::span<const char> packed_action, CallFlags flags = CallFlags::none)
+   {
+      auto result_size = raw::call(packed_action.data(), packed_action.size(), flags);
+      if constexpr (not std::is_same_v<void, R>)
       {
-         psio::shared_view_ptr<T> result(psio::size_tag{result_size});
-         raw::getResult(result.data(), result_size, 0);
-         check(result.validate(), "value returned was not serialized as expected");
-         return result;
+         if constexpr (hasExport<R>)
+         {
+            psio::shared_view_ptr<exportType<R>> result(psio::size_tag{result_size});
+            raw::getResult(result.data(), result_size, 0);
+            if (!result.validate())
+            {
+               psio::view<const Action> action(
+                   psio::prevalidated<std::span<const char>>{packed_action});
+               auto method_name = action.method().unpack().str();
+               check(false, std::string("value returned from ") + method_name +
+                                " was not serialized as expected");
+            }
+            auto                                         handles_size = raw::importHandles();
+            psio::shared_view_ptr<std::vector<KvHandle>> handles(psio::size_tag{handles_size});
+            raw::getResult(handles.data(), handles_size, 0);
+            return ImportView<R>{std::move(result), std::move(handles)};
+         }
+         else
+         {
+            psio::shared_view_ptr<R> result(psio::size_tag{result_size});
+            raw::getResult(result.data(), result_size, 0);
+            if (!result.validate())
+            {
+               psio::view<const Action> action(
+                   psio::prevalidated<std::span<const char>>{packed_action});
+               auto method_name = action.method().unpack().str();
+               check(false, std::string("value returned from ") + method_name +
+                                " was not serialized as expected");
+            }
+            return result;
+         }
       }
-      return {};
    }
 
-   /**
- *  This will dispatch a sync call and grab the return
- */
-   struct sync_call_proxy
+   template <typename T>
+   auto fraccall(const Action& a, CallFlags flags = CallFlags::none)
    {
-      sync_call_proxy(AccountNumber s, AccountNumber r) : sender(s), receiver(r) {}
+      auto packed_action = psio::convert_to_frac(a);
+      return fraccall<T>(psio::convert_to_frac(a), flags);
+   }
+
+   template <typename T>
+   struct TypedAction
+   {
+      AccountNumber   sender;   ///< Account sending the action
+      AccountNumber   service;  ///< Service to execute the action
+      MethodNumber    method;   ///< Service method to execute
+      psio::nested<T> rawData;  ///< Data for the method
+      PSIO_REFLECT(TypedAction, sender, service, method, rawData)
+   };
+
+   struct ActionViewProxy
+   {
+      ActionViewProxy(AccountNumber s, AccountNumber r) : sender(s), receiver(r) {}
 
       AccountNumber sender;
       AccountNumber receiver;
 
-      // TODO: remove idx (unused)
-      template <uint32_t idx, uint64_t Name, auto MemberPtr, typename... Args>
+      template <typename... T, typename... U>
+      auto packImpl(std::tuple<T...>*,
+                    std::tuple<U...>*,
+                    MethodNumber method,
+                    const std::conditional_t<psio::PackableAs<U, T>, U, T>&... args) const
+      {
+         using Args = std::tuple<decltype(args)...>;
+         TypedAction<Args> action{sender, receiver, method, {Args(args...)}};
+         psio::size_stream ss;
+         psio::to_frac(action, ss);
+         check(ss.size <= std::numeric_limits<uint32_t>::max(), "packImpl: size overflow");
+         psio::shared_view_ptr<TypedAction<std::tuple<T...>>> result(
+             psio::size_tag{static_cast<uint32_t>(ss.size)});
+         psio::fast_buf_stream stream(result.data(), result.size());
+         psio::to_frac(action, stream);
+         return result;
+      }
+
+      template <uint32_t idx, auto MemberPtr, typename... Args>
       auto call(Args&&... args) const
       {
-         auto act = action_builder_proxy(sender, receiver)
-                        .call<idx, Name, MemberPtr, Args...>(std::forward<Args>(args)...);
+         using member_class = decltype(psio::class_of_member(MemberPtr));
+         using param_tuple  = typename psio::make_param_value_tuple<decltype(MemberPtr)>::type;
+
+         static_assert(std::tuple_size<param_tuple>() <= sizeof...(Args),
+                       "too few arguments passed to method");
+         static_assert(std::tuple_size<param_tuple>() == sizeof...(Args),
+                       "too many arguments passed to method");
+
+         return packImpl(
+             (param_tuple*)nullptr, (std::tuple<std::remove_cvref_t<Args>...>*)nullptr,
+             MethodNumber(*psio::reflect<member_class>::member_function_names[idx].begin()),
+             std::forward<Args>(args)...);
+      }
+   };
+
+   /**
+    *  This will dispatch a sync call and grab the return
+    */
+   struct sync_call_proxy
+   {
+      sync_call_proxy(AccountNumber s, AccountNumber r, CallFlags flags = CallFlags::none)
+          : sender(s), receiver(r), flags(flags)
+      {
+      }
+
+      AccountNumber sender;
+      AccountNumber receiver;
+      CallFlags     flags;
+
+      template <uint32_t idx, auto MemberPtr, typename... Args>
+      auto call(Args&&... args) const
+      {
+         auto act = ActionViewProxy(sender, receiver)
+                        .call<idx, MemberPtr, Args...>(std::forward<Args>(args)...);
          using result_type = decltype(psio::result_of(MemberPtr));
-         if constexpr (not std::is_same_v<void, result_type>)
-         {
-            return psibase::fraccall<result_type>(act);
-         }
-         else
-         {
-            psibase::fraccall<void>(act);
-         }
+         return psibase::fraccall<std::remove_cv_t<psio::remove_view_t<result_type>>>(
+             act.data_without_size_prefix(), flags);
       }
    };
 
    struct sync_call_unpack_proxy
    {
-      sync_call_unpack_proxy(AccountNumber s, AccountNumber r) : sender(s), receiver(r) {}
+      sync_call_unpack_proxy(AccountNumber s, AccountNumber r, CallFlags flags = CallFlags::none)
+          : sender(s), receiver(r), flags(flags)
+      {
+      }
 
       AccountNumber sender;
       AccountNumber receiver;
+      CallFlags     flags;
 
-      // TODO: remove idx (unused)
-      template <uint32_t idx, uint64_t Name, auto MemberPtr, typename... Args>
+      template <uint32_t idx, auto MemberPtr, typename... Args>
       auto call(Args&&... args) const
       {
-         auto act = action_builder_proxy(sender, receiver)
-                        .call<idx, Name, MemberPtr, Args...>(std::forward<Args>(args)...);
+         auto act = ActionViewProxy(sender, receiver)
+                        .call<idx, MemberPtr, Args...>(std::forward<Args>(args)...);
          using result_type = decltype(psio::result_of(MemberPtr));
          if constexpr (not std::is_same_v<void, result_type>)
-            return psibase::fraccall<result_type>(act).unpack();
+            return psibase::fraccall<std::remove_cv_t<psio::remove_view_t<result_type>>>(
+                       act.data_without_size_prefix(), flags)
+                .unpack();
          else
-            psibase::fraccall<void>(act);
+            psibase::fraccall<void>(act.data_without_size_prefix(), flags);
       }
    };
 
@@ -124,16 +222,18 @@ namespace psibase
       AccountNumber sender;
       DbId          event_log;
 
-      // TODO: remove idx (unused)
-      template <uint32_t idx, uint64_t Name, auto MemberPtr, typename... Args>
+      template <uint32_t idx, auto MemberPtr, typename... Args>
       EventNumber call(Args&&... args) const
       {
-         using param_tuple = decltype(psio::tuple_remove_view(psio::args_as_tuple(MemberPtr)));
+         using member_class = decltype(psio::class_of_member(MemberPtr));
+         using param_tuple  = psio::make_param_value_tuple<decltype(MemberPtr)>::type;
          static_assert(std::tuple_size<param_tuple>() == sizeof...(Args),
                        "insufficient arguments passed to method");
 
-         return psibase::putSequential(event_log, sender, Name,
-                                       param_tuple(std::forward<Args>(args)...));
+         return psibase::putSequential(
+             event_log, sender,
+             MethodNumber{*psio::reflect<member_class>::member_function_names[idx].begin()},
+             param_tuple(std::forward<Args>(args)...));
       }
    };
 
@@ -147,29 +247,24 @@ namespace psibase
       AccountNumber sender;
       DbId          event_log;
 
-      // TODO: remove idx (unused)
-      template <uint32_t idx, uint64_t Name, auto MemberPtr>
+      template <uint32_t idx, auto MemberPtr>
       auto call(EventNumber n) const
       {
-         auto size         = raw::getSequential(event_log, n);
-         using param_tuple = decltype(psio::tuple_remove_view(psio::args_as_tuple(MemberPtr)));
-         struct EventHeader
+         using member_class = decltype(psio::class_of_member(MemberPtr));
+         using param_tuple  = typename psio::make_param_value_tuple<decltype(MemberPtr)>::type;
+         AccountNumber service;
+         MethodNumber  type;
+         MethodNumber  expected_type{
+             *psio::reflect<member_class>::member_function_names[idx].begin()};
+         auto result = psibase::getSequential<param_tuple>(event_log, n, &sender, &expected_type,
+                                                           &service, &type);
+         if (!result)
          {
-            AccountNumber sender;
-            MethodNumber  event_type;
-         };
-
-         EventHeader header;
-         raw::getResult(&header, sizeof(header));
-         psibase::check(header.event_type == Name, "unexpected event type");
-         psibase::check(header.sender == sender, "unexpected event sender");
-
-         std::vector<char> tmp(size);
-         raw::getResult(tmp.data(), tmp.size(), 0);
-
-         psio::shared_view_ptr<param_tuple> ptr(psio::size_tag{size - 8});
-         memcpy(ptr.data(), tmp.data() + 8, ptr.size());
-         return ptr;
+            psibase::check(type == expected_type, "unexpected event type");
+            psibase::check(service == sender, "unexpected event sender");
+            psibase::check(false, "event not found");
+         }
+         return std::move(*result);
       }
    };
 
@@ -286,6 +381,10 @@ namespace psibase
       ///
       /// [Service::events] is a shortcut for constructing this.
       EventReader(DbId elog = psibase::DbId::historyEvent) : Base{getReceiver(), elog} {}
+      EventReader(AccountNumber sender, DbId elog = psibase::DbId::historyEvent)
+          : Base{sender, elog}
+      {
+      }
 
       /// Read Ui events
       ///
@@ -338,12 +437,18 @@ namespace psibase
       using Base = typename psio::reflect<T>::template proxy<sync_call_unpack_proxy>;
       using Base::Base;
 
-      auto from(AccountNumber other) const { return Actor(other, Base::receiver); }
+      auto from(AccountNumber other) const { return Actor(other, Base::receiver, Base::flags); }
 
       template <typename Other>
-      auto to(uint64_t otherReceiver) const
+      auto to(AccountNumber otherReceiver = Other::service) const
       {
-         return Actor<Other>(Base::sender, AccountNumber(otherReceiver));
+         return Actor<Other>(Base::psio_get_proxy().sender, AccountNumber(otherReceiver),
+                             Base::psio_get_proxy().flags);
+      }
+
+      auto withFlags(CallFlags flags)
+      {
+         return Actor{Base::psio_get_proxy().sender, Base::psio_get_proxy().receiver, flags};
       }
 
       auto* operator->() const { return this; }
@@ -352,7 +457,8 @@ namespace psibase
       auto view() const
       {
          return typename psio::reflect<T>::template proxy<sync_call_proxy>{
-             Base::psio_get_proxy().sender, Base::psio_get_proxy().receiver};
+             Base::psio_get_proxy().sender, Base::psio_get_proxy().receiver,
+             Base::psio_get_proxy().flags};
       }
    };
 
@@ -361,19 +467,24 @@ namespace psibase
    {
       AccountNumber sender;
       AccountNumber receiver;
+      CallFlags     flags;
 
-      Actor(AccountNumber s = AccountNumber(), AccountNumber r = AccountNumber())
-          : sender(s), receiver(r)
+      Actor(AccountNumber s     = AccountNumber(),
+            AccountNumber r     = AccountNumber(),
+            CallFlags     flags = CallFlags::none)
+          : sender(s), receiver(r), flags(flags)
       {
       }
 
-      auto from(AccountNumber other) const { return Actor(other, receiver); }
+      auto from(AccountNumber other) const { return Actor(other, receiver, flags); }
 
       template <typename Other>
       auto to(uint64_t otherReceiver) const
       {
-         return Actor<Other>(sender, AccountNumber(otherReceiver));
+         return Actor<Other>(sender, AccountNumber(otherReceiver), flags);
       }
+
+      auto withFlags(CallFlags flags) { return Actor{sender, receiver, flags}; }
 
       auto* operator->() const { return this; }
       auto& operator*() const { return *this; }
@@ -449,7 +560,10 @@ namespace psibase
       ///
       /// This returns a new `Actor` object instead of modifying this.
       template <typename Other>
-      Actor<Other> to(uint64_t otherReceiver) const;
+      Actor<Other> to(AccountNumber otherReceiver = Other::service) const;
+
+      /// Set flags for calls
+      Actor<T> withFlags(CallFlags flags);
 
       /// Return this
       Actor<T>* operator->() const;
@@ -461,8 +575,8 @@ namespace psibase
 
    struct EmptyService
    {
+      PSIO_REFLECT(EmptyService)
    };
-   PSIO_REFLECT(EmptyService)
 
    /// Call a service
    ///
@@ -538,6 +652,7 @@ namespace psibase
    {
       using base = typename psio::reflect<T>::template proxy<action_builder_proxy>;
       using base::base;
+      transactor() : base(T::service, T::service) {}
 
       auto from(AccountNumber other) const
       {
@@ -552,6 +667,13 @@ namespace psibase
 
       auto* operator->() const { return this; }
       auto& operator*() const { return *this; }
+   };
+
+   template <typename T>
+   struct ActionViewBuilder : public psio::reflect<T>::template proxy<ActionViewProxy>
+   {
+      using base = typename psio::reflect<T>::template proxy<ActionViewProxy>;
+      using base::base;
    };
 
 }  // namespace psibase

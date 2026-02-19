@@ -1,178 +1,257 @@
 #include <psibase/DefaultTestChain.hpp>
 
+#include <psibase/fileUtil.hpp>
+#include <psibase/package.hpp>
 #include <psibase/serviceEntry.hpp>
-#include <services/system/AccountSys.hpp>
-#include <services/system/AuthAnySys.hpp>
-#include <services/system/AuthEcSys.hpp>
-#include <services/system/CommonSys.hpp>
-#include <services/system/ProducerSys.hpp>
-#include <services/system/ProxySys.hpp>
-#include <services/system/RAccountSys.hpp>
-#include <services/system/RAuthEcSys.hpp>
-#include <services/system/RProducerSys.hpp>
-#include <services/system/RProxySys.hpp>
-#include <services/system/SetCodeSys.hpp>
-#include <services/system/TransactionSys.hpp>
-#include <services/system/VerifyEcSys.hpp>
-#include <services/user/ExploreSys.hpp>
-#include <services/user/PsiSpaceSys.hpp>
+#include <services/system/AuthAny.hpp>
+#include <services/system/AuthDelegate.hpp>
+#include <services/system/Producers.hpp>
+#include <services/system/SetCode.hpp>
+
 #include <utility>
 #include <vector>
 
 using namespace psibase;
 using namespace SystemService;
+using namespace UserService;
 
-DefaultTestChain::DefaultTestChain(
-    const std::vector<std::pair<AccountNumber, const char*>>& additionalServices,
-    uint64_t                                                  max_objects,
-    uint64_t                                                  hot_addr_bits,
-    uint64_t                                                  warm_addr_bits,
-    uint64_t                                                  cool_addr_bits,
-    uint64_t                                                  cold_addr_bits)
-    : TestChain{max_objects, hot_addr_bits, warm_addr_bits, cool_addr_bits, cold_addr_bits}
+namespace
+{
+   // These are the services that MUST be installed at genesis
+   // - Anything that is used in the genesis block
+   // - SetCode to install the remaining services at the beginning
+   //   of the next block.
+   constexpr AccountNumber essentialServices[] = {Transact::service, SetCode::service};
+
+   // Returns the number of leading packages up to and including
+   // the last one containing an essential service.
+   std::size_t countEssentialPackages(std::span<PackagedService> packages)
+   {
+      auto iter = packages.rbegin();
+      auto end  = packages.rend();
+      for (; iter != end; ++iter)
+      {
+         for (auto account : iter->accounts())
+         {
+            if (std::ranges::contains(essentialServices, account))
+            {
+               return end - iter;
+            }
+         }
+      }
+      return end - iter;
+   }
+
+   void pushGenesisTransaction(TestChain&                 chain,
+                               std::span<PackagedService> service_packages,
+                               std::size_t                priority_count)
+   {
+      std::vector<GenesisService> services;
+      for (auto& s : service_packages.subspan(0, priority_count))
+      {
+         s.genesis(services);
+      }
+
+      auto trace = chain.pushTransaction(  //
+          chain.makeTransaction(           //
+              {                            //
+               // TODO: set sender,service,method in a way that's helpful to block explorers
+               Action{.sender  = AccountNumber{"foo"},  // ignored
+                      .service = AccountNumber{"bar"},  // ignored
+                      .method  = {},
+                      .rawData = psio::convert_to_frac(
+                          GenesisActionData{.services = std::move(services)})}}),
+          {});
+
+      check(psibase::show(false, trace) == "", "Failed to deploy genesis services");
+   }
+
+   std::vector<Action> getInitialActions(std::span<PackagedService> service_packages,
+                                         std::size_t                priority_count,
+                                         bool                       installUI)
+   {
+      transactor<Accounts> asys{Accounts::service, Accounts::service};
+      transactor<Transact> tsys{Transact::service, Transact::service};
+      std::vector<Action>  actions;
+      bool                 has_packages = false;
+
+      for (auto& s : service_packages.subspan(priority_count))
+      {
+         s.installCode(actions);
+      }
+
+      for (auto& s : service_packages)
+      {
+         s.setSchema(actions);
+      }
+
+      for (auto& s : service_packages)
+      {
+         for (auto account : s.accounts())
+         {
+            if (account == Packages::service)
+            {
+               has_packages = true;
+            }
+            if (!s.hasService(account))
+            {
+               actions.push_back(asys.newAccount(account, AuthAny::service, true));
+            }
+         }
+
+         s.regServer(actions);
+
+         if (installUI)
+         {
+            s.storeData(actions);
+         }
+
+         s.postinstall(actions, service_packages);
+      }
+
+      transactor<Producers> psys{Producers::service, Producers::service};
+      std::vector<Producer> producerConfig = {{"firstproducer"_a, {}}};
+      actions.push_back(psys.setProducers(producerConfig));
+
+      auto root = AccountNumber{"root"};
+      actions.push_back(asys.newAccount(root, AuthAny::service, true));
+
+      // If a package sets an auth service for an account, we should not override it
+      std::vector<AccountNumber> accountsWithAuth;
+      for (const auto& act : actions)
+      {
+         if (act.service == Accounts::service && act.method == MethodNumber{"setAuthServ"})
+         {
+            accountsWithAuth.push_back(act.sender);
+         }
+      }
+      std::ranges::sort(accountsWithAuth);
+
+      for (auto& s : service_packages)
+      {
+         for (auto account : s.accounts())
+         {
+            if (!std::ranges::binary_search(accountsWithAuth, account))
+            {
+               actions.push_back(
+                   transactor<AuthDelegate>{account, AuthDelegate::service}.setOwner(root));
+               actions.push_back(asys.from(account).setAuthServ(AuthDelegate::service));
+            }
+         }
+      }
+
+      if (has_packages)
+      {
+         for (auto& s : service_packages)
+         {
+            s.commitInstall(actions, root);
+         }
+      }
+
+      actions.push_back(tsys.finishBoot());
+
+      return actions;
+   }
+
+   std::vector<SignedTransaction> makeTransactions(TestChain& chain, std::vector<Action>&& actions)
+   {
+      std::vector<SignedTransaction> result;
+      std::vector<Action>            group;
+      std::size_t                    size = 0;
+      for (auto& act : actions)
+      {
+         size += act.rawData.size();
+         group.push_back(std::move(act));
+         if (size >= 1024 * 1024)
+         {
+            result.push_back(SignedTransaction{chain.makeTransaction(std::move(group), 30)});
+            size = 0;
+         }
+      }
+      if (!group.empty())
+      {
+         result.push_back(SignedTransaction{chain.makeTransaction(std::move(group), 30)});
+      }
+      return result;
+   }
+
+   DefaultTestChain& defaultChainInstance()
+   {
+      static DefaultTestChain result{DefaultTestChain::defaultPackages(), false, {}, false};
+      return result;
+   }
+
+}  // namespace
+
+std::string TestChain::defaultPackageDir()
+{
+   auto packageRoot = std::getenv("PSIBASE_DATADIR");
+   check(!!packageRoot, "Cannot find package directory: PSIBASE_DATADIR not defined");
+   return std::string(packageRoot) + "/packages";
+}
+
+void TestChain::boot(const std::vector<std::string>& names, bool installUI)
+{
+   auto registry = DirectoryRegistry(defaultPackageDir());
+   std::vector<PackagedService> packages;
+   for (auto info : registry.resolve(names, essentialServices))
+   {
+      packages.push_back(registry.get(info));
+   }
+   setAutoBlockStart(false);
+   startBlock();
+   auto numEssential = countEssentialPackages(packages);
+   pushGenesisTransaction(*this, packages, numEssential);
+   auto transactions =
+       makeTransactions(*this, getInitialActions(packages, numEssential, installUI));
+   std::vector<Checksum256> transactionIds;
+   for (const auto& trx : transactions)
+   {
+      transactionIds.push_back(sha256(trx.transaction.data(), trx.transaction.size()));
+   }
+   auto trace = pushTransaction(
+       makeTransaction(
+           {transactor<Transact>{Transact::service, Transact::service}.startBoot(transactionIds)}),
+       {});
+   check(psibase::show(false, trace) == "", "Failed to boot");
+   for (const auto& trx : transactions)
+   {
+      startBlock();
+      auto trace = pushTransaction(trx);
+      check(psibase::show(false, trace) == "", "Failed to boot");
+   }
+   setAutoBlockStart(true);
+   startBlock();
+}
+
+std::vector<std::string> DefaultTestChain::defaultPackages()
+{
+   return {"Accounts", "AuthAny",     "AuthDelegate", "AuthSig",    "CommonApi",
+           "CpuLimit", "Credentials", "Events",       "Explorer",   "Invite",
+           "Nft",      "Packages",    "Producers",    "HttpServer", "Sites",
+           "SetCode",  "StagedTx",    "Symbol",       "Tokens",     "Transact"};
+}
+
+DefaultTestChain::DefaultTestChain() : TestChain(defaultChainInstance(), true)
 {
    startBlock();
-   deploySystemServices();
-   startBlock();  // TODO: Why is this startBlock necessary? Without it,
-                  //   all subsequent transactions will silently fail.
-
-   createSysServiceAccounts();
-   setBlockProducers();
-   registerSysRpc();
-
-   for (const auto& c : additionalServices)
-   {
-      addService(c.first, c.second);
-   }
 }
 
-void DefaultTestChain::deploySystemServices(bool show /* = false */)
+DefaultTestChain::DefaultTestChain(const std::vector<std::string>& names,
+                                   bool                            installUI,
+                                   const DatabaseConfig&           dbconfig,
+                                   bool                            pub)
+    : TestChain(dbconfig, pub)
 {
-   auto
-       trace =
-           pushTransaction(      //
-               makeTransaction(  //
-                   {             //
-                    Action{
-                        .sender  = AccountNumber{"foo"},  // ignored
-                        .service = AccountNumber{"bar"},  // ignored
-                        .method  = {},
-                        .rawData =
-                            psio::convert_to_frac(
-                                GenesisActionData{
-                                    .services =
-                                        {
-                                            {
-                                                .service = SystemService::TransactionSys::service,
-                                                .flags =
-                                                    SystemService::TransactionSys::serviceFlags,
-                                                .code = readWholeFile("TransactionSys.wasm"),
-                                            },
-                                            {
-                                                .service = SystemService::SetCodeSys::service,
-                                                .flags   = SystemService::SetCodeSys::serviceFlags,
-                                                .code    = readWholeFile("SetCodeSys.wasm"),
-                                            },
-                                            {
-                                                .service = SystemService::AccountSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("AccountSys.wasm"),
-                                            },
-                                            {
-                                                .service = SystemService::ProducerSys::service,
-                                                .flags   = SystemService::ProducerSys::serviceFlags,
-                                                .code    = readWholeFile("ProducerSys.wasm"),
-                                            },
-                                            {
-                                                .service = ProxySys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("ProxySys.wasm"),
-                                            },
-                                            {
-                                                .service = SystemService::AuthAnySys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("AuthAnySys.wasm"),
-                                            },
-                                            {
-                                                .service = SystemService::AuthEcSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("AuthEcSys.wasm"),
-                                            },
-                                            {
-                                                .service = SystemService::VerifyEcSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("VerifyEcSys.wasm"),
-                                            },
-                                            {
-                                                .service = CommonSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("CommonSys.wasm"),
-                                            },
-                                            {
-                                                .service = RAccountSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("RAccountSys.wasm"),
-                                            },
-                                            {
-                                                .service = RProducerSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("RProducerSys.wasm"),
-                                            },
-                                            {
-                                                .service = ExploreSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("ExploreSys.wasm"),
-                                            },
-                                            {
-                                                .service = RAuthEcSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("RAuthEcSys.wasm"),
-                                            },
-                                            {
-                                                .service = RProxySys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("RProxySys.wasm"),
-                                            },
-                                            {
-                                                .service = PsiSpaceSys::service,
-                                                .flags   = 0,
-                                                .code    = readWholeFile("PsiSpaceSys.wasm"),
-                                            },
-                                        },
-                                }),
-                    }}),
-               {});
-
-   check(psibase::show(show, trace) == "", "Failed to deploy genesis services");
+   boot(names, installUI);
 }
 
-void DefaultTestChain::setBlockProducers(bool show /* = false*/)
-{
-   transactor<SystemService::ProducerSys> psys{SystemService::ProducerSys::service,
-                                               SystemService::ProducerSys::service};
-   std::vector<ProducerConfigRow>         producerConfig = {{"testchain"_a, {}}};
-   auto trace = pushTransaction(makeTransaction({psys.setProducers(producerConfig)}));
-   check(psibase::show(show, trace) == "", "Failed to set producers");
-}
-
-void DefaultTestChain::createSysServiceAccounts(bool show /* = false */)
-{
-   transactor<SystemService::AccountSys>     asys{SystemService::TransactionSys::service,
-                                              SystemService::AccountSys::service};
-   transactor<SystemService::TransactionSys> tsys{SystemService::TransactionSys::service,
-                                                  SystemService::TransactionSys::service};
-   auto trace = pushTransaction(makeTransaction({asys.init(), tsys.init()}));
-
-   check(psibase::show(show, trace) == "", "Failed to create system service accounts");
-}
-
-AccountNumber DefaultTestChain::add_account(
+AccountNumber DefaultTestChain::addAccount(
     AccountNumber acc,
-    AccountNumber authService /* = AccountNumber("auth-any-sys") */,
+    AccountNumber authService /* = AccountNumber("auth-any") */,
     bool          show /* = false */)
 {
-   transactor<SystemService::AccountSys> asys(SystemService::TransactionSys::service,
-                                              SystemService::AccountSys::service);
+   transactor<Accounts> asys(Accounts::service, Accounts::service);
 
    auto trace = pushTransaction(  //
        makeTransaction({asys.newAccount(acc, authService, true)}));
@@ -182,50 +261,66 @@ AccountNumber DefaultTestChain::add_account(
    return acc;
 }
 
-AccountNumber DefaultTestChain::add_account(
+AccountNumber DefaultTestChain::addAccount(
     const char*   acc,
-    AccountNumber authService /* = AccountNumber("auth-any-sys")*/,
+    AccountNumber authService /* = AccountNumber("auth-any")*/,
     bool          show /* = false */)
 {
-   return add_account(AccountNumber(acc), authService, show);
+   return addAccount(AccountNumber(acc), authService, show);
 }
 
-AccountNumber DefaultTestChain::add_ec_account(AccountNumber    name,
-                                               const PublicKey& public_key,
-                                               bool             show /* = false */)
+AccountNumber DefaultTestChain::addAccount(AccountNumber                        name,
+                                           const AuthSig::SubjectPublicKeyInfo& public_key,
+                                           bool                                 show /* = false */)
 {
-   transactor<SystemService::AccountSys> asys(SystemService::AccountSys::service,
-                                              SystemService::AccountSys::service);
-   transactor<SystemService::AuthEcSys>  ecsys(SystemService::AuthEcSys::service,
-                                               SystemService::AuthEcSys::service);
+   transactor<Accounts>         accounts(Accounts::service, Accounts::service);
+   transactor<AuthSig::AuthSig> authsig(AuthSig::AuthSig::service, AuthSig::AuthSig::service);
 
    auto trace = pushTransaction(makeTransaction({
-       asys.newAccount(name, SystemService::AuthAnySys::service, true),
-       ecsys.from(name).setKey(public_key),
-       asys.from(name).setAuthCntr(SystemService::AuthEcSys::service),
+       accounts.newAccount(name, AuthAny::service, true),
+       authsig.from(name).setKey(public_key),
+       accounts.from(name).setAuthServ(AuthSig::AuthSig::service),
    }));
 
-   check(psibase::show(show, trace) == "", "Failed to add ec account");
+   check(psibase::show(show, trace) == "", "Failed to add authenticated account");
    return name;
-}  // add_ec_account()
+}  // addAccount()
 
-AccountNumber DefaultTestChain::add_ec_account(const char*      name,
-                                               const PublicKey& public_key,
-                                               bool             show /* = false */)
+AccountNumber DefaultTestChain::addAccount(const char*                          name,
+                                           const AuthSig::SubjectPublicKeyInfo& public_key,
+                                           bool                                 show /* = false */)
 {
-   return add_ec_account(AccountNumber(name), public_key, show);
+   return addAccount(AccountNumber(name), public_key, show);
 }
 
 AccountNumber DefaultTestChain::addService(AccountNumber acc,
                                            const char*   filename,
                                            bool          show /* = false */)
 {
-   add_account(acc, SystemService::AuthAnySys::service, show);
+   addAccount(acc, AuthAny::service, show);
 
-   transactor<SystemService::SetCodeSys> scsys{acc, SystemService::SetCodeSys::service};
+   transactor<SetCode> scsys{acc, SetCode::service};
 
    auto trace =
        pushTransaction(makeTransaction({{scsys.setCode(acc, 0, 0, readWholeFile(filename))}}));
+
+   check(psibase::show(show, trace) == "", "Failed to create service");
+
+   return acc;
+}  // addService()
+
+AccountNumber DefaultTestChain::addService(AccountNumber acc,
+                                           const char*   filename,
+                                           std::uint64_t flags,
+                                           bool          show /* = false */)
+{
+   addAccount(acc, AuthAny::service, show);
+
+   transactor<SetCode> scsys{acc, SetCode::service};
+   auto setFlags = transactor<SetCode>{SetCode::service, SetCode::service}.setFlags(acc, flags);
+
+   auto trace = pushTransaction(
+       makeTransaction({{scsys.setCode(acc, 0, 0, readWholeFile(filename)), setFlags}}));
 
    check(psibase::show(show, trace) == "", "Failed to create service");
 
@@ -237,157 +332,4 @@ AccountNumber DefaultTestChain::addService(const char* acc,
                                            bool        show /* = false */)
 {
    return addService(AccountNumber(acc), filename, show);
-}
-
-void DefaultTestChain::registerSysRpc()
-{
-   auto r = ProxySys::service;
-
-   // Register servers
-   std::vector<psibase::Action> a{
-       transactor<ProxySys>{CommonSys::service, r}.registerServer(CommonSys::service),
-       transactor<ProxySys>{AccountSys::service, r}.registerServer(RAccountSys::service),
-       transactor<ProxySys>{ExploreSys::service, r}.registerServer(ExploreSys::service),
-       transactor<ProxySys>{AuthEcSys::service, r}.registerServer(RAuthEcSys::service),
-       transactor<ProxySys>{ProxySys::service, r}.registerServer(RProxySys::service),
-       transactor<ProxySys>{PsiSpaceSys::service, r}.registerServer(PsiSpaceSys::service),
-   };
-
-   auto trace = pushTransaction(makeTransaction(std::move(a)));
-   check(psibase::show(false, trace) == "", "Failed to register system rpc services");
-
-   transactor<CommonSys>   rpcCommon(CommonSys::service, CommonSys::service);
-   transactor<RAccountSys> rpcAccount(RAccountSys::service, RAccountSys::service);
-   transactor<ExploreSys>  rpcExplore(ExploreSys::service, ExploreSys::service);
-   transactor<RAuthEcSys>  rpcAuthEc(RAuthEcSys::service, RAuthEcSys::service);
-   transactor<PsiSpaceSys> rpcPsiSpace(PsiSpaceSys::service, PsiSpaceSys::service);
-
-   // Store UI files
-   std::string cdir      = "../services";
-   std::string comDir    = cdir + "/user/CommonSys";
-   std::string accDir    = cdir + "/system/AccountSys";
-   std::string expDir    = cdir + "/user/ExploreSys";
-   std::string psiSpDir  = cdir + "/user/PsiSpaceSys";
-   std::string authEcDir = cdir + "/system/AuthEcSys";
-   std::string thirdPty  = comDir + "/common/thirdParty/src";
-
-   const std::string html = "text/html";
-   const std::string js   = "text/javascript";
-   const std::string css  = "text/css";
-   const std::string ttf  = "font/ttf";
-   const std::string svg  = "image/svg+xml";
-
-   std::vector<psibase::Action> b{
-       // CommonSys Fancy UI
-       rpcCommon.storeSys("/index.html", html, readWholeFile(comDir + "/ui/dist/index.html")),
-       rpcCommon.storeSys("/index.js", js, readWholeFile(comDir + "/ui/dist/index.js")),
-       rpcCommon.storeSys("/style.css", css, readWholeFile(comDir + "/ui/dist/style.css")),
-       rpcCommon.storeSys("/ninebox.svg", svg, readWholeFile(comDir + "/ui/dist/ninebox.svg")),
-       rpcCommon.storeSys("/loader.svg", svg, readWholeFile(comDir + "/ui/dist/loader.svg")),
-       rpcCommon.storeSys("/psibase.svg", svg, readWholeFile(comDir + "/ui/dist/psibase.svg")),
-       rpcCommon.storeSys("/app-account-desktop.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-account-desktop.svg")),
-       rpcCommon.storeSys("/app-account-mobile.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-account-mobile.svg")),
-       rpcCommon.storeSys("/app-explore-desktop.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-explore-desktop.svg")),
-       rpcCommon.storeSys("/app-explore-mobile.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-explore-mobile.svg")),
-       rpcCommon.storeSys("/app-wallet-desktop.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-wallet-desktop.svg")),
-       rpcCommon.storeSys("/app-wallet-mobile.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-wallet-mobile.svg")),
-       rpcCommon.storeSys("/app-psispace-mobile.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-psispace-mobile.svg")),
-       rpcCommon.storeSys("/app-psispace-mobile.svg", svg,
-                          readWholeFile(comDir + "/ui/dist/app-psispace-mobile.svg")),
-
-       // CommonSys Basic UI
-       //    rpcCommon.storeSys("/index.html", html, readWholeFile(comDir + "/ui/vanilla/index.html")),
-       //    rpcCommon.storeSys("/ui/index.js", js, readWholeFile(comDir + "/ui/vanilla/index.js")),
-
-       // CommonSys Other
-       rpcCommon.storeSys("/ui/common.index.html", html,
-                          readWholeFile(comDir + "/ui/vanilla/common.index.html")),
-
-       rpcCommon.storeSys("/common/rpc.mjs", js, readWholeFile(comDir + "/common/rpc.mjs")),
-       rpcCommon.storeSys("/common/useGraphQLQuery.mjs", js,
-                          readWholeFile(comDir + "/common/useGraphQLQuery.mjs")),
-       rpcCommon.storeSys("/common/useLocalStorage.mjs", js,
-                          readWholeFile(comDir + "/common/useLocalStorage.mjs")),
-       rpcCommon.storeSys("/common/SimpleUI.mjs", js,
-                          readWholeFile(comDir + "/common/SimpleUI.mjs")),
-       rpcCommon.storeSys("/common/keyConversions.mjs", js,
-                          readWholeFile(comDir + "/common/keyConversions.mjs")),
-       rpcCommon.storeSys("/common/widgets.mjs", js, readWholeFile(comDir + "/common/widgets.mjs")),
-       rpcCommon.storeSys("/common/fonts/raleway.css", css, readWholeFile(comDir + "/common/fonts/raleway.css")),
-       rpcCommon.storeSys("/common/fonts/raleway-variable-italic.ttf", ttf, readWholeFile(comDir + "/common/fonts/raleway-variable-italic.ttf")),
-       rpcCommon.storeSys("/common/fonts/raleway-variable-normal.ttf", ttf, readWholeFile(comDir + "/common/fonts/raleway-variable-normal.ttf")),
-       rpcCommon.storeSys("/common/fonts/red-hat-mono.css", css, readWholeFile(comDir + "/common/fonts/red-hat-mono.css")),
-       rpcCommon.storeSys("/common/fonts/red-hat-mono-variable-normal.ttf", ttf, readWholeFile(comDir + "/common/fonts/red-hat-mono-variable-normal.ttf")),
-
-       // CommonSys - 3rd party
-       rpcCommon.storeSys("/common/iframeResizer.js", js,
-                          readWholeFile(thirdPty + "/iframeResizer.js")),
-       rpcCommon.storeSys("/common/iframeResizer.contentWindow.js", js,
-                          readWholeFile(thirdPty + "/iframeResizer.contentWindow.js")),
-       rpcCommon.storeSys("/common/react.production.min.js", js,
-                          readWholeFile(thirdPty + "/react.production.min.js")),
-       rpcCommon.storeSys("/common/react-dom.production.min.js", js,
-                          readWholeFile(thirdPty + "/react-dom.production.min.js")),
-       rpcCommon.storeSys("/common/react-router-dom.min.js", js,
-                          readWholeFile(thirdPty + "/react-router-dom.min.js")),
-       rpcCommon.storeSys("/common/htm.module.js", js, readWholeFile(thirdPty + "/htm.module.js")),
-       rpcCommon.storeSys("/common/react.development.js", js,
-                          readWholeFile(thirdPty + "/react.development.js")),
-       rpcCommon.storeSys("/common/react-dom.development.js", js,
-                          readWholeFile(thirdPty + "/react-dom.development.js")),
-       rpcCommon.storeSys("/common/semantic-ui-react.min.js", js,
-                          readWholeFile(thirdPty + "/semantic-ui-react.min.js")),
-       rpcCommon.storeSys("/common/use-local-storage-state.mjs", js,
-                          readWholeFile(thirdPty + "/useLocalStorageState.js")),
-
-       // AccountSys Basic UI
-       //    rpcAccount.storeSys("/index.html", html, readWholeFile(accDir + "/ui/vanilla/index.html")),
-       //    rpcAccount.storeSys("/ui/index.js", js, readWholeFile(accDir + "/ui/vanilla/index.js")),
-
-       // AccountSys Fancy UI
-       rpcAccount.storeSys("/app-account.svg", svg,
-                           readWholeFile(accDir + "/ui/dist/app-account.svg")),
-       rpcAccount.storeSys("/index.html", html, readWholeFile(accDir + "/ui/dist/index.html")),
-       rpcAccount.storeSys("/index.js", js, readWholeFile(accDir + "/ui/dist/index.js")),
-       rpcAccount.storeSys("/lock-closed.svg", svg,
-                           readWholeFile(accDir + "/ui/dist/lock-closed.svg")),
-       rpcAccount.storeSys("/lock-open.svg", svg, readWholeFile(accDir + "/ui/dist/lock-open.svg")),
-       rpcAccount.storeSys("/logout.svg", svg, readWholeFile(accDir + "/ui/dist/logout.svg")),
-       rpcAccount.storeSys("/refresh.svg", svg, readWholeFile(accDir + "/ui/dist/refresh.svg")),
-       rpcAccount.storeSys("/style.css", css, readWholeFile(accDir + "/ui/dist/style.css")),
-
-       // AuthEcSys
-       rpcAuthEc.storeSys("/index.html", html, readWholeFile(authEcDir + "/ui/index.html")),
-       rpcAuthEc.storeSys("/ui/index.js", js, readWholeFile(authEcDir + "/ui/index.js")),
-
-       // ExploreSys
-       //    rpcExplore.storeSys("/ui/index.js", js, readWholeFile(expDir + "/ui/index.js"))
-
-       // PsiSpaceSys Fancy UI
-       rpcPsiSpace.storeSys("/index.html", html, readWholeFile(psiSpDir + "/ui/dist/index.html")),
-       rpcPsiSpace.storeSys("/index.js", js, readWholeFile(psiSpDir + "/ui/dist/index.js")),
-       rpcPsiSpace.storeSys("/loader.svg", svg, readWholeFile(psiSpDir + "/ui/dist/loader.svg")),
-       rpcPsiSpace.storeSys("/app-psispace-icon.svg", svg,
-                            readWholeFile(psiSpDir + "/ui/dist/app-psispace-icon.svg")),
-       rpcPsiSpace.storeSys("/style.css", css, readWholeFile(psiSpDir + "/ui/dist/style.css")),
-       rpcPsiSpace.storeSys(
-           "/default-profile/default-profile.html", html,
-           readWholeFile(psiSpDir + "/ui/dist/default-profile/default-profile.html")),
-       rpcPsiSpace.storeSys("/default-profile/index.js", js,
-                            readWholeFile(psiSpDir + "/ui/dist/default-profile/index.js")),
-       rpcPsiSpace.storeSys("/default-profile/loader.svg", svg,
-                            readWholeFile(psiSpDir + "/ui/dist/default-profile/loader.svg")),
-       rpcPsiSpace.storeSys("/default-profile/style.css", css,
-                            readWholeFile(psiSpDir + "/ui/dist/default-profile/style.css")),
-   };
-
-   trace = pushTransaction(makeTransaction(std::move(b)));
-   check(psibase::show(false, trace) == "", "Failed to add UI files to system rpc services");
 }

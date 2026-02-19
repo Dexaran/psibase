@@ -1,0 +1,29 @@
+[package]
+name = "fractals"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[package.metadata.psibase]
+server = "r-fractals"
+plugin = "fractals-plugin"
+data = [{ src = "../ui/dist", dst = "/" }]
+postinstall = [
+    { sender = "fractals", service = "sites", method = "enablespa", rawData = "010001" },
+]
+
+[dependencies]
+psibase.workspace = true
+psibase_macros.workspace = true
+evaluations = { path = "../../Evaluations/service", version = "0.23.0" }
+async-graphql.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+psibase-user-workspace-hack.workspace = true
+
+[dev-dependencies]
+fractals-pkg = { path = "..", version = "0.23.0" }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--html-in-header", "katex-header.html"]

@@ -1,0 +1,128 @@
+package config:plugin;
+
+interface branding {
+    use host:types/types.{error};
+
+    /// Change the network logo
+    upload-network-logo: func(logo: list<u8>) -> result<_, error>;
+
+    /// Change the network name
+    set-network-name: func(name: string) -> result<_, error>;
+}
+
+interface packaging {
+    use host:types/types.{error};
+
+    set-account-sources: func(accounts: list<string>) -> result<_, error>;
+}
+
+interface settings {
+    use host:types/types.{error};
+
+    /// Set snapshot interval period network wide
+    set-snapshot-time: func(seconds: u32) -> result<_, error>;
+
+    /// Set system token
+    set-system-token: func(token-id: u32) -> result<_, error>;
+}
+
+interface producers {
+    use host:types/types.{error};
+    use sites:plugin/types.{file};
+
+    /// Set the producers for CFT consensus.
+    /// This also changes the current consensus mode to CFT (crash fault tolerant).
+    /// The keys used in the specified auth claims must
+    set-cft-consensus: func(prods: list<string>) -> result<_, error>;
+
+    /// Set the producers for BFT consensus.
+    /// This also changes the current consensus mode to BFT (byzantine fault tolerant).
+    set-bft-consensus: func(prods: list<string>) -> result<_, error>;
+
+    /// Set the producers for the current consensus mode.
+    set-producers: func(prods: list<string>) -> result<_, error>;
+
+    /// Sets the maximum number of producers for the network
+    set-max-prods: func(max-prods: u8) -> result<_, error>;
+}
+
+interface symbol {
+    use host:types/types.{error};
+
+
+    /// Creates a new symbol. An NFT representing ownership of this symbol will be credited to the creator account.
+    ///
+    /// Parameters:
+    /// * `symbol` - The symbol to create
+    /// * `recipient` - The recipient account to receive the ownership NFT
+    create: func(symbol: string, recipient: string) -> result<_, error>;
+
+    /// Start selling symbols of a certain length
+    sell-length: func(length: u8, initial-price: u64, target: u32, floor-price: u64) -> result<_, error>;
+
+    /// Delete symbol length, preventing further sales.
+    ///
+    /// Parameters:
+    /// * `length` - Length of symbol to stop selling
+    del-length: func(length: u8) -> result<_, error>;
+}
+
+interface virtual-server {
+    use host:types/types.{error};
+    use virtual-server:plugin/types.{
+        server-specs, 
+        network-variables,
+        cpu-pricing-params, 
+        net-pricing-params
+    };
+
+    /// Initialize the billing system
+    /// A system token must have already been set to enable billing.
+    /// 
+    /// Parameters:
+    /// * `fee-receiver` - The account that will receive the billing fees
+    init-billing: func(fee-receiver: string) -> result<_, error>;
+
+    /// Set network variables
+    /// These variables change how the network specs are derived from the server specs.
+    /// 
+    /// Parameters:
+    /// * `variables` - The network variables
+    set-network-variables: func(variables: network-variables) -> result<_, error>;
+
+    /// Enable the billing system
+    /// This must be called after the billing system has been initialized and the
+    /// system token has been set.
+    /// 
+    /// Parameters:
+    /// * `enabled` - Whether to enable the billing system
+    enable-billing: func(enabled: bool) -> result<_, error>;
+
+    /// Set the virtual server specs
+    /// It is from these specs that the pricing for network resources is derived.
+    /// 
+    /// Parameters:
+    /// * `specs` - The virtual server specs
+    set-specs: func(specs: server-specs) -> result<_, error>;
+
+    /// Set the CPU pricing parameters
+    /// 
+    /// Parameters:
+    /// * `params` - The CPU pricing parameters
+    set-cpu-pricing-params: func(params: cpu-pricing-params) -> result<_, error>;
+
+    /// Set the network pricing parameters
+    /// 
+    /// Parameters:
+    /// * `params` - The network pricing parameters
+    set-net-pricing-params: func(params: net-pricing-params) -> result<_, error>;
+}
+
+world imports {
+    import producers;
+    import branding;
+    import packaging;
+    import settings;
+    import symbol;
+    import virtual-server;
+}

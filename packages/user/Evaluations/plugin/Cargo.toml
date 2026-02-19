@@ -1,0 +1,38 @@
+[package]
+name = "evaluations-plugin"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+evaluations = { path = "../service/", version = "0.23.0" }
+psibase.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wit-bindgen-rt.workspace = true
+ecies = { version = "0.2", default-features = false, features = ["pure"] }
+rand = "0.9.1"
+average = "0.16.0"
+sha2 = "0.10.8"
+psibase-user-workspace-hack.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "evaluations:plugin"
+
+[package.metadata.component.target]
+world = "impl"
+
+[package.metadata.component.target.dependencies]
+"accounts:plugin" = { path = "../../../system/Accounts/plugin/accounts/wit/world.wit" }
+"host:common" = { path = "../../Host/plugin/common/wit/world.wit" }
+"host:types" = { path = "../../Host/plugin/types/wit/world.wit" }
+"clientdata:plugin" = { path = "../../ClientData/plugin/wit/world.wit" }
+"aes:plugin" = { path = "../../Aes/plugin/wit/world.wit" }
+"transact:plugin" = { path = "../../../system/Transact/plugin/wit/world.wit" }
+"base64:plugin" = { path = "../../Base64/plugin/wit/world.wit" }
+
+[dev-dependencies]

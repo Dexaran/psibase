@@ -1,4 +1,4 @@
-#include <psibase/nativeFunctions.hpp>
+#include <psibase/api.hpp>
 
 #include <psio/from_bin.hpp>
 
@@ -33,29 +33,29 @@ namespace psibase
    Action getCurrentAction()
    {
       auto data = getResult(raw::getCurrentAction());
-      return psio::convert_from_frac<Action>(data);
+      return psio::from_frac<Action>(psio::prevalidated{data});
    }
 
    psio::shared_view_ptr<Action> getCurrentActionView()
    {
       psio::shared_view_ptr<Action> ptr(psio::size_tag{raw::getCurrentAction()});
       raw::getResult(ptr.data(), ptr.size(), 0);
-      check(ptr.validate_all_known(), "invalid action format");
+      check(ptr.validate_strict(), "invalid action format");
       return ptr;
    }
 
-   std::vector<char> call(const char* action, uint32_t len)
+   std::vector<char> call(const char* action, uint32_t len, CallFlags flags)
    {
-      return getResult(raw::call(action, len));
+      return getResult(raw::call(action, len, flags));
    }
 
-   std::vector<char> call(psio::input_stream action)
+   std::vector<char> call(psio::input_stream action, CallFlags flags)
    {
-      return getResult(raw::call(action.pos, action.remaining()));
+      return getResult(raw::call(action.pos, action.remaining(), flags));
    }
 
-   std::vector<char> call(const Action& action)
+   std::vector<char> call(const Action& action, CallFlags flags)
    {
-      return call(psio::convert_to_frac(action));
+      return call(psio::convert_to_frac(action), flags);
    }
 }  // namespace psibase

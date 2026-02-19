@@ -1,0 +1,16 @@
+package branding:plugin;
+
+interface api {
+    set-network-name: func(name: string);
+    set-logo: func(logo: list<u8>);
+}
+
+interface queries {
+    use host:types/types.{error};
+    get-network-name: func() -> result<string, error>;
+}
+
+world imports {
+    import api;
+    import queries;
+}

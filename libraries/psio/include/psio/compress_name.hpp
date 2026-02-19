@@ -26,7 +26,7 @@ THE SOFTWARE.
  Data Compression With Arithmetic Coding
  by Mark Nelson
  published at:
-http://marknelson.us/2014/10/19/data-compression-with-arithmetic-coding
+https://marknelson.us/posts/2014/10/19/data-compression-with-arithmetic-coding.html
 
  It has been modified by Daniel Larimer for the specific purpose of compressing
  short names and the encoder has been updated to use precomputed tables that
@@ -34,7 +34,7 @@ change based on the prior element.
 
 */
 #pragma once
-#include <consthash/cityhash64.hxx>
+#include <cstdint>
 #include <limits>
 #include <string>
 
@@ -73,7 +73,7 @@ namespace psio
          {
             auto cumulative_frequency = model_cf[m_last_byte];
             prob p                    = {cumulative_frequency[c], cumulative_frequency[c + 1],
-                      cumulative_frequency[model_width]};
+                                         cumulative_frequency[model_width]};
             update(c);
             return p;
          }
@@ -104,8 +104,8 @@ namespace psio
 
          static constexpr uint32_t symbol_count      = 27;
          static constexpr char    symbol_to_char[27] = {0,   'e', 'a', 'i', 'o', 't', 'n', 'r', 's',
-                                                     'l', 'c', 'u', 'h', 'd', 'p', 'm', 'y', 'g',
-                                                     'b', 'f', 'w', 'v', 'k', 'z', 'x', 'q', 'j'};
+                                                        'l', 'c', 'u', 'h', 'd', 'p', 'm', 'y', 'g',
+                                                        'b', 'f', 'w', 'v', 'k', 'z', 'x', 'q', 'j'};
          static constexpr uint8_t char_to_symbol[256] = {
              0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 0,  0,  0,  0,
              0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0, 0,  0,  0,  0,
@@ -207,6 +207,32 @@ namespace psio
          uint8_t               m_last_byte = char_to_symbol[0];
       };
 
+      inline constexpr std::uint64_t seahash(std::string_view input)
+      {
+         auto g = [](std::uint64_t x)
+         {
+            std::uint64_t p = 0x6eed0e9da4d94a4fu;
+            x *= p;
+            x = x ^ ((x >> 32) >> (x >> 60));
+            x *= p;
+            return x;
+         };
+         std::uint64_t state[4] = {0x16f11fe89b0d677cu, 0xb480a793d8e6c86cu, 0x6fe2e5aaf078ebc9u,
+                                   0x14f994a4c5259381u};
+         for (std::size_t i = 0; i < input.size(); i += 8)
+         {
+            std::uint64_t n     = 0;
+            auto          bytes = std::min(input.size() - i, std::size_t{8});
+            for (std::size_t j = 0; j < bytes; ++j)
+            {
+               n += static_cast<std::uint64_t>(static_cast<std::uint8_t>(input[i + j])) << (j * 8);
+            }
+            auto& item = state[(i / 8) % 4];
+            item       = g(item ^ n);
+         }
+         return g(state[0] ^ state[1] ^ state[2] ^ state[3] ^ input.size());
+      }
+
       // TODO: what happened to the _-elimination rule?
       inline constexpr uint64_t method_to_number(std::string_view m_input)
       {
@@ -242,14 +268,12 @@ namespace psio
          uint8_t       m_NextByte = 0;
          unsigned char m_Mask     = 0x80;
          uint64_t      m_output   = 0;
-         uint64_t      m_seed     = 0xbadd00d00b00b569;
          int           m_bitc     = 0;
 
          auto put_bit = [&](bool b)
          {
             if (b and m_bitc == 63)
             {
-               m_seed   = m_output;
                m_output = 0;
                m_bit    = 64;
             }
@@ -360,9 +384,7 @@ namespace psio
          //       in hash_name()?
          if (not m_output)
          {
-            m_output = consthash::city64_seed(m_input.data(), m_input.size(),
-                                              m_seed);  // psio::murmur64(m_input.data(),
-                                                        // m_input.size(), m_seed);
+            m_output = seahash(m_input);
             m_output |= (uint64_t(0x01) << (64 - 8));
          }
 
@@ -420,7 +442,6 @@ namespace psio
          code_value high  = func_model::MAX_CODE;
          code_value low   = 0;
          code_value value = 0;
-         int        count = 0;
          for (int i = 0; (i < func_model::code_value_bits) and not_eof; i++)
          {
             value <<= 1;
@@ -429,7 +450,6 @@ namespace psio
          while (not_eof)
          {
             code_value range = high - low + 1;
-            ++count;
 
             if (range == 0)
                return "RUNTIME LOGIC ERROR";

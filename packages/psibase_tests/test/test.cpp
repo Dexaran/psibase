@@ -1,0 +1,99 @@
+#include <catch2/catch_all.hpp>
+#include <psibase/DefaultTestChain.hpp>
+#include <services/system/Transact.hpp>
+#include <services/test/TestExport.hpp>
+#include <services/test/TestImport.hpp>
+#include <services/test/TestKV.hpp>
+#include <services/test/TestServiceEntry.hpp>
+#include <services/test/TestTable.hpp>
+
+using namespace psibase;
+using namespace SystemService;
+using namespace TestService;
+
+TEST_CASE("called entry point")
+{
+   DefaultTestChain t;
+   t.addService(TestServiceEntry::service, "TestServiceEntry.wasm");
+   CHECK(t.from(TestServiceEntry::service)
+             .to<TestServiceEntry>()
+             .call(3, "Counting down")
+             .returnVal() == 3);
+
+   auto counters = TestServiceEntry{}.open<CallCounterTable>();
+   auto called   = counters.get(CallCounterRow::called).value_or(CallCounterRow{});
+   CHECK(called.count == 4);
+   auto start = counters.get(CallCounterRow::start).value_or(CallCounterRow{});
+   CHECK(start.count == 1);
+}
+
+TEST_CASE("kv")
+{
+   DefaultTestChain t;
+
+   t.addService(TestKV::service, "TestKV.wasm", TestKV::flags);
+   CHECK(t.from(TestKV::service).to<TestKV>().test().succeeded());
+}  // kv
+
+TEST_CASE("table")
+{
+   DefaultTestChain t;
+
+   t.addService(TestTable::service, "TestTable.wasm");
+   auto testTable = t.from(TestTable::service).to<TestTable>();
+   CHECK(testTable.getSingle().succeeded());
+   CHECK(testTable.getMulti().succeeded());
+   CHECK(testTable.getCompound().succeeded());
+   CHECK(testTable.removeSingle().succeeded());
+   CHECK(testTable.removeMulti().succeeded());
+   CHECK(testTable.subindex().succeeded());
+}  // table
+
+TEST_CASE("import/export handles")
+{
+   DefaultTestChain t;
+
+   t.addService(TestExport::service, "TestExport.wasm", TestExport::flags);
+   t.addService(TestImport::service, "TestImport.wasm", TestImport::flags);
+   t.http(HttpRequest{
+       .host        = "x-admin.psibase.io",
+       .method      = "PUT",
+       .target      = "/services/" + TestExport::service.str(),
+       .contentType = "application/wasm",
+       .body        = readWholeFile("TestExport.wasm"),
+   });
+   PSIBASE_SUBJECTIVE_TX
+   {
+      auto table = Native::subjective().open<CodeTable>();
+      auto row   = table.get(TestExport::service).value();
+      row.flags |= CodeRow::isReplacement;
+      table.put(row);
+   }
+
+   auto exp = t.to<TestExport>();
+   auto imp = t.to<TestImport>();
+
+   CHECK(exp.testPlain().succeeded());
+   CHECK(exp.testRpc().succeeded());
+   CHECK(exp.testCallback().succeeded());
+   CHECK(imp.testPlain().succeeded());
+   CHECK(imp.testRpc().succeeded());
+   CHECK(imp.testCallback().succeeded());
+}
+
+TEST_CASE("Tester socket cleanup")
+{
+   DefaultTestChain t;
+   auto             reply  = t.asyncGet(Transact::service, "/stats");
+   auto             len    = psio::convert_to_key(socketPrefix()).size();
+   auto             minKey = socketKey(1);
+   auto             row1   = t.kvGreaterEqual<SocketRow>(DbId::nativeSession, minKey, len);
+   REQUIRE(row1.has_value());
+   reply.get();
+   CHECK(!t.kvGreaterEqual<SocketRow>(DbId::nativeSession, minKey, len).has_value());
+
+   auto reply2 = t.asyncGet(Transact::service, "/stats");
+   auto row2   = t.kvGreaterEqual<SocketRow>(DbId::nativeSession, minKey, len);
+   REQUIRE(row2.has_value());
+   CHECK(row2->fd == row1->fd);
+}

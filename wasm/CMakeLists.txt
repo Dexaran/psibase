@@ -3,11 +3,14 @@ cmake_policy(VERSION 3.16)
 project(wasm)
 enable_testing()
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(IS_WASM YES)
+set(BUILD_STATIC ON)
 get_filename_component(ROOT_SOURCE_DIR ${CMAKE_SOURCE_DIR}/.. ABSOLUTE)
 get_filename_component(ROOT_BINARY_DIR ${CMAKE_BINARY_DIR}/.. ABSOLUTE)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
@@ -67,49 +70,45 @@ macro(conditional_add)
     endif()
 endmacro()
 
-file(COPY ${ROOT_SOURCE_DIR}/LICENSE DESTINATION ${ROOT_BINARY_DIR}/psidk/licenses)
+include(GNUInstallDirs)
+install(FILES ${ROOT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/psibase/licenses COMPONENT libpsibase)
+
+set(WASM_FEATURES -msign-ext -mnontrapping-fptoint -msimd128 -mbulk-memory)
 
 add_library(wasm-base INTERFACE)
-target_compile_options(wasm-base INTERFACE -fno-exceptions -DCOMPILING_WASM -mthread-model single -O3)
-target_link_options(wasm-base INTERFACE -Wl,--strip-all -O3 -L${ROOT_BINARY_DIR}/wasm/deps/lib)
+target_compile_options(wasm-base INTERFACE ${WASM_FEATURES} -fno-exceptions -DCOMPILING_WASM -mthread-model single -O3)
+target_link_options(wasm-base INTERFACE ${WASM_FEATURES} -B${ROOT_SOURCE_DIR}/libraries/psibase/sdk/psibase- -Wl,--strip-all -O3 -L${ROOT_BINARY_DIR}/wasm/deps/lib)
 
 add_library(wasm-base-debug INTERFACE)
-target_compile_options(wasm-base-debug INTERFACE -fno-exceptions -DCOMPILING_WASM -mthread-model single -ggdb)
-target_link_options(wasm-base-debug INTERFACE -ggdb -L${ROOT_BINARY_DIR}/wasm/deps/lib)
+target_compile_options(wasm-base-debug INTERFACE ${WASM_FEATURES} -fno-exceptions -DCOMPILING_WASM -mthread-model single -ggdb)
+target_link_options(wasm-base-debug INTERFACE ${WASM_FEATURES} -ggdb -L${ROOT_BINARY_DIR}/wasm/deps/lib)
 
-# -psidk variant of build targets need paths converted
-function(add_psidk_base_lib suffix)
-    add_library(wasm-base${suffix}-psidk INTERFACE)
-    target_link_libraries(wasm-base${suffix}-psidk INTERFACE wasm-base${suffix})
-    target_compile_options(wasm-base${suffix}-psidk INTERFACE
-            -ffile-prefix-map=${ROOT_BINARY_DIR}/wasm/boost/=psidk:/boost/
-            -ffile-prefix-map=${ROOT_BINARY_DIR}/wasm/catch2/=psidk:/catch2/
-            -ffile-prefix-map=${ROOT_SOURCE_DIR}/services/=psidk:/services/
-            -ffile-prefix-map=${ROOT_SOURCE_DIR}/external/=psidk:/
-            -ffile-prefix-map=${ROOT_SOURCE_DIR}/libraries/=psidk:/
-            -ffile-prefix-map=${WASI_SDK_PREFIX}/=psidk-wasi-sdk:/
-    )
+function(target_mapped_include_directories target type)
+    target_include_directories(${target} ${type} ${ARGN})
+    foreach(dir IN LISTS ARGN)
+        get_filename_component(full_path ${dir} ABSOLUTE)
+        target_compile_options(${target} ${type} -ffile-prefix-map=${full_path}=${CMAKE_INSTALL_FULL_INCLUDEDIR})
+    endforeach()
 endfunction()
-add_psidk_base_lib("")
-add_psidk_base_lib("-debug")
 
-set(DEP_URL https://github.com/eoscommunity/Eden/releases/download/deps)
+set(DEP_URL https://github.com/gofractally/psibase/releases/download/deps)
 set(GMP_ARCHIVE gmp-6.2.1.tar.zst)
 set(GMP_EXTRACTED gmp-6.2.1)
-set(OPENSSL_ARCHIVE openssl-1.1.1k.tar.gz)
-set(OPENSSL_EXTRACTED openssl-1.1.1k)
-set(ZLIB_ARCHIVE zlib-1.2.11.tar.gz)
-set(ZLIB_EXTRACTED zlib-1.2.11)
-set(FLAT_BUFFERS_URL https://github.com/google/flatbuffers/archive/refs/tags )
-set(FLAT_BUFFERS_ARCHIVE v2.0.0.tar.gz )
-set(FLAT_BUFFERS_EXTRACTED flatbuffers )
+set(GMP_SHA256 8a0c3596c09855450eb67f6e81c5fb6a10babfc4a803d012a877b54c430ea66b)
+set(OPENSSL_ARCHIVE openssl-3.0.7.tar.gz)
+set(OPENSSL_EXTRACTED openssl-3.0.7)
+set(OPENSSL_SHA256 83049d042a260e696f62406ac5c08bf706fd84383f945cf21bd61e9ed95c396e)
+set(ZLIB_ARCHIVE zlib-1.2.13.tar.gz)
+set(ZLIB_EXTRACTED zlib-1.2.13)
+set(ZLIB_SHA256 b3a24de97a8fdbc835b9833169501030b8977031bcb54b3b3ac13740f846ab30)
 set(DEP_PREFIX ${CMAKE_BINARY_DIR}/deps)
 
-function(download url archive)
+function(download url archive hash)
     if(NOT EXISTS ${archive})
         message("Downloading ${url}")
         file(DOWNLOAD ${url} ${archive}
             STATUS download_status
+            EXPECTED_HASH SHA256=${hash}
             TIMEOUT 600
             SHOW_PROGRESS
             TLS_VERIFY ON)
@@ -123,7 +122,7 @@ endfunction()
 
 # These builds are done at generation time so cmake's find_* commands can find them
 if(NOT EXISTS ${DEP_PREFIX}/lib/libz.a)
-    download(${DEP_URL}/${ZLIB_ARCHIVE} ${DEP_PREFIX}/${ZLIB_ARCHIVE})
+    download(${DEP_URL}/${ZLIB_ARCHIVE} ${DEP_PREFIX}/${ZLIB_ARCHIVE} ${ZLIB_SHA256})
     message("building zlib")
     execute_process(
         WORKING_DIRECTORY ${DEP_PREFIX}
@@ -135,7 +134,7 @@ if(NOT EXISTS ${DEP_PREFIX}/lib/libz.a)
             && export CXX=\"${CMAKE_CXX_COMPILER_LAUNCHER} ${CMAKE_CXX_COMPILER}\"  \
             && export AR=${CMAKE_AR}                                                \
             && export RANLIB=${CMAKE_RANLIB}                                        \
-            && export CFLAGS=\"--sysroot=${CMAKE_SYSROOT}\"                         \
+            && export CFLAGS=\"--sysroot=${CMAKE_SYSROOT} --target=wasm32-wasip1\"  \
             && ./configure --prefix=${DEP_PREFIX} --static                          \
             && make -j                                                              \
             && make -j install                                                      \
@@ -144,7 +143,7 @@ if(NOT EXISTS ${DEP_PREFIX}/lib/libz.a)
 endif()
 
 if(NOT EXISTS ${DEP_PREFIX}/lib/libgmp.a)
-    download(${DEP_URL}/${GMP_ARCHIVE} ${DEP_PREFIX}/${GMP_ARCHIVE})
+    download(${DEP_URL}/${GMP_ARCHIVE} ${DEP_PREFIX}/${GMP_ARCHIVE} ${GMP_SHA256})
     message("building gmp")
     execute_process(
         WORKING_DIRECTORY ${DEP_PREFIX}
@@ -154,7 +153,7 @@ if(NOT EXISTS ${DEP_PREFIX}/lib/libgmp.a)
             && cd ${GMP_EXTRACTED}                                                          \
             && ./configure                                                                  \
                 CC=\"${CMAKE_C_COMPILER_LAUNCHER} ${CMAKE_C_COMPILER}\"                     \
-                CFLAGS=\"--sysroot=${CMAKE_SYSROOT} -D_WASI_EMULATED_SIGNAL\"               \
+                CFLAGS=\"--sysroot=${CMAKE_SYSROOT} -D_WASI_EMULATED_SIGNAL --target=wasm32-wasip1\"               \
                 LDFLAGS=-lwasi-emulated-signal                                              \
                 --prefix=${DEP_PREFIX}                                                      \
                 --host none                                                                 \
@@ -166,9 +165,9 @@ if(NOT EXISTS ${DEP_PREFIX}/lib/libgmp.a)
 endif()
 
 if(NOT EXISTS ${DEP_PREFIX}/lib/libssl.a)
-    download(${DEP_URL}/${OPENSSL_ARCHIVE} ${DEP_PREFIX}/${OPENSSL_ARCHIVE})
+    download(${DEP_URL}/${OPENSSL_ARCHIVE} ${DEP_PREFIX}/${OPENSSL_ARCHIVE} ${OPENSSL_SHA256})
     message("building openssl")
-    set(OPENSSL_BUILD_FLAGS "--sysroot=${CMAKE_SYSROOT} -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -DNO_SYSLOG -DOPENSSL_NO_SECURE_MEMORY")
+    set(OPENSSL_BUILD_FLAGS "--sysroot=${CMAKE_SYSROOT} --target=wasm32-wasip1 -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -DNO_SYSLOG -DOPENSSL_NO_SECURE_MEMORY -Wno-error=implicit-function-declaration")
     execute_process(
         WORKING_DIRECTORY ${DEP_PREFIX}
         COMMAND bash -c "\
@@ -177,7 +176,7 @@ if(NOT EXISTS ${DEP_PREFIX}/lib/libssl.a)
             && cd ${OPENSSL_EXTRACTED}                                                      \
             && ./Configure linux-generic32                                                  \
                 --prefix=${DEP_PREFIX}                                                      \
-                no-afalgeng no-asm no-dso no-shared no-sock no-tests no-threads no-ui       \
+                no-afalgeng no-asm no-autoalginit no-autoerrinit no-autoload-config no-dso no-async no-shared no-sock no-tests no-threads no-ui       \
                 CC=\"${CMAKE_C_COMPILER_LAUNCHER} ${CMAKE_C_COMPILER}\"                     \
                 CXX=\"${CMAKE_CXX_COMPILER_LAUNCHER} ${CMAKE_CXX_COMPILER}\"                \
                 AR=${CMAKE_AR}                                                              \
@@ -189,28 +188,14 @@ if(NOT EXISTS ${DEP_PREFIX}/lib/libssl.a)
     )
 endif()
 
-if(NOT EXISTS ${DEP_PREFIX}/lib/libsecp256k1.a)
-    message("building secp256k1")
-    execute_process(
-        WORKING_DIRECTORY ${DEP_PREFIX}
-        COMMAND bash -c "\
-               rm -rf secp256k1                                                         \
-            && cp -r ${ROOT_SOURCE_DIR}/external/secp256k1 secp256k1                    \
-            && cd secp256k1                                                             \
-            && ./autogen.sh                                                             \
-            && export CC=\"${CMAKE_C_COMPILER_LAUNCHER} ${CMAKE_C_COMPILER}\"           \
-            && export AR=${CMAKE_AR}                                                    \
-            && export RANLIB=${CMAKE_RANLIB}                                            \
-            && export CFLAGS=\"--sysroot=${CMAKE_SYSROOT} -DUSE_FORCE_WIDEMUL_INT64\"   \
-            && ./configure --prefix=${DEP_PREFIX} --host=wasm32                         \
-            && make -j                                                                  \
-            && make -j install                                                          \
-        "
-    )
-endif()
+# For generating the schema
+include(../libraries/psibase/sdk/pack_service.cmake)
 
 add_subdirectory(../external external)
-add_subdirectory(../libraries libraries)
-add_subdirectory(../services services)
-add_subdirectory(../programs programs)
 add_subdirectory(boost)
+add_subdirectory(sqlite3)
+add_subdirectory(../libraries libraries)
+add_subdirectory(../packages packages)
+add_subdirectory(../programs programs)
+
+install(FILES ${DEP_PREFIX}/lib/libcrypto.a ${DEP_PREFIX}/lib/libz.a TYPE LIB COMPONENT libpsibase)

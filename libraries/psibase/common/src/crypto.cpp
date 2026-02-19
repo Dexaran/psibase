@@ -1,3 +1,5 @@
+#define OPENSSL_SUPPRESS_DEPRECATED
+
 #include <psibase/crypto.hpp>
 
 #include <openssl/sha.h>
@@ -6,229 +8,98 @@
 #include <psio/psio_ripemd160.hpp>
 #include <psio/to_bin.hpp>
 
-namespace
-{
-   enum KeyType : uint8_t
-   {
-      k1 = 0,
-      r1 = 1,
-   };
-
-   constexpr char base58Chars[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-   constexpr auto createBase58Map()
-   {
-      std::array<int8_t, 256> base58Map{{0}};
-      for (unsigned i = 0; i < base58Map.size(); ++i)
-         base58Map[i] = -1;
-      for (unsigned i = 0; i < sizeof(base58Chars); ++i)
-         base58Map[base58Chars[i]] = i;
-      return base58Map;
-   }
-
-   constexpr auto base58Map = createBase58Map();
-
-   template <typename Container>
-   void base58ToBinary(Container& result, std::string_view s)
-   {
-      std::size_t offset = result.size();
-      for (auto& src_digit : s)
-      {
-         int carry = base58Map[static_cast<uint8_t>(src_digit)];
-         psibase::check(carry >= 0, "Invalid key or signature");
-         for (std::size_t i = offset; i < result.size(); ++i)
-         {
-            auto& result_byte = result[i];
-            int   x           = static_cast<uint8_t>(result_byte) * 58 + carry;
-            result_byte       = x;
-            carry             = x >> 8;
-         }
-         if (carry)
-            result.push_back(static_cast<uint8_t>(carry));
-      }
-      for (auto& src_digit : s)
-         if (src_digit == '1')
-            result.push_back(0);
-         else
-            break;
-      std::reverse(result.begin() + offset, result.end());
-   }
-
-   template <typename Container>
-   std::string binaryToBase58(const Container& bin)
-   {
-      std::string result("");
-      for (auto byte : bin)
-      {
-         static_assert(sizeof(byte) == 1);
-         int carry = static_cast<uint8_t>(byte);
-         for (auto& result_digit : result)
-         {
-            int x        = (base58Map[result_digit] << 8) + carry;
-            result_digit = base58Chars[x % 58];
-            carry        = x / 58;
-         }
-         while (carry)
-         {
-            result.push_back(base58Chars[carry % 58]);
-            carry = carry / 58;
-         }
-      }
-      for (auto byte : bin)
-         if (byte)
-            break;
-         else
-            result.push_back('1');
-      std::reverse(result.begin(), result.end());
-      return result;
-   }
-
-   template <typename... Container>
-   std::array<unsigned char, 20> digestSuffixRipemd160(const Container&... data)
-   {
-      std::array<unsigned char, 20>   digest;
-      psio_ripemd160::ripemd160_state self;
-      psio_ripemd160::ripemd160_init(&self);
-      (psio_ripemd160::ripemd160_update(&self, data.data(), data.size()), ...);
-      psibase::check(psio_ripemd160::ripemd160_digest(&self, digest.data()),
-                     "Invalid key or signature");
-      return digest;
-   }
-
-   template <typename Key>
-   Key stringToKey(std::string_view s, KeyType type, std::string_view suffix)
-   {
-      std::vector<char> whole;
-      whole.push_back(uint8_t{type});
-      base58ToBinary(whole, s);
-      psibase::check(whole.size() > 5, "Invalid key or signature");
-      auto ripe_digest =
-          digestSuffixRipemd160(std::string_view(whole.data() + 1, whole.size() - 5), suffix);
-      psibase::check(memcmp(ripe_digest.data(), whole.data() + whole.size() - 4, 4) == 0,
-                     "Invalid key or signature");
-      whole.erase(whole.end() - 4, whole.end());
-      return psio::convert_from_bin<Key>(whole);
-   }
-
-   template <typename Key>
-   std::string keyToString(const Key& key, std::string_view suffix, const char* prefix)
-   {
-      auto whole = psio::convert_to_bin(key);
-      auto ripe_digest =
-          digestSuffixRipemd160(std::string_view(whole.data() + 1, whole.size() - 1), suffix);
-      whole.insert(whole.end(), ripe_digest.data(), ripe_digest.data() + 4);
-      return prefix + binaryToBase58(std::string_view(whole.data() + 1, whole.size() - 1));
-   }
-}  // namespace
-
 namespace psibase
 {
    Checksum256 sha256(const char* data, size_t length)
    {
       //std::array<unsigned char, 256 / 8> result;
+      SHA256_CTX ctx;
+      SHA256_Init(&ctx);
+      SHA256_Update(&ctx, (const unsigned char*)data, length);
       Checksum256 result;
-      SHA256((const unsigned char*)data, length, (unsigned char*)result.data());
+      SHA256_Final((unsigned char*)result.data(), &ctx);
       return result;
    }
 
-   std::string publicKeyToString(const PublicKey& key)
+   // RFC 2104
+   Checksum256 hmacSha256(const char* key,
+                          std::size_t keyLen,
+                          const char* data,
+                          std::size_t dataLen)
    {
-      if (key.data.index() == KeyType::k1)
+      constexpr std::size_t B                             = 64;
+      unsigned char         buf[B + Checksum256{}.size()] = {};
+      SHA256_CTX            ctx;
+      SHA256_Init(&ctx);
+      // pad or hash key
+      if (keyLen <= B)
       {
-         return keyToString(key, "K1", "PUB_K1_");
-      }
-      else if (key.data.index() == KeyType::r1)
-      {
-         return keyToString(key, "R1", "PUB_R1_");
+         std::memcpy(buf, key, keyLen);
       }
       else
       {
-         check(false, "Expected public key");
-         __builtin_unreachable();
+         Checksum256 hashedKey = sha256(key, keyLen);
+         std::memcpy(buf, hashedKey.data(), hashedKey.size());
       }
+      // K ^ ipad
+      for (std::size_t i = 0; i < B; ++i)
+      {
+         buf[i] ^= 0x36;
+      }
+      SHA256_Update(&ctx, buf, B);
+      SHA256_Update(&ctx, reinterpret_cast<const unsigned char*>(data), dataLen);
+      SHA256_Final(buf + B, &ctx);
+      // K ^ opad
+      for (std::size_t i = 0; i < B; ++i)
+      {
+         buf[i] ^= 0x36 ^ 0x5c;
+      }
+      SHA256_Init(&ctx);
+      SHA256_Update(&ctx, buf, sizeof(buf));
+      Checksum256 result;
+      SHA256_Final(result.data(), &ctx);
+      return result;
    }
 
-   PublicKey publicKeyFromString(std::string_view s)
+   Checksum256 hmacSha256(std::span<const char> key, std::span<const char> data)
    {
-      PublicKey result;
-      // TODO: remove this case
-      // if (s.substr(0, 3) == "EOS")
-      // {
-      //    return stringToKey<PublicKey>(s.substr(3), KeyType::k1, "");
-      // }
-      if (s.substr(0, 7) == "PUB_K1_")
-      {
-         return stringToKey<PublicKey>(s.substr(7), KeyType::k1, "K1");
-      }
-      else if (s.substr(0, 7) == "PUB_R1_")
-      {
-         return stringToKey<PublicKey>(s.substr(7), KeyType::r1, "R1");
-      }
-      else
-      {
-         check(false, "Expected public key");
-         __builtin_unreachable();
-      }
+      return hmacSha256(key.data(), key.size(), data.data(), data.size());
    }
 
-   std::string privateKeyToString(const PrivateKey& private_key)
+   Checksum256 Merkle::combine(const Checksum256& lhs, const Checksum256& rhs)
    {
-      if (private_key.data.index() == KeyType::k1)
-         return keyToString(private_key, "K1", "PVT_K1_");
-      else if (private_key.data.index() == KeyType::r1)
-         return keyToString(private_key, "R1", "PVT_R1_");
-      else
-      {
-         check(false, "Expected private key");
-         __builtin_unreachable();
-      }
+      char buf[1 + 2 * Checksum256{}.size()];
+      buf[0]   = '\1';
+      auto pos = buf + 1;
+      std::memcpy(pos, lhs.data(), lhs.size());
+      pos += lhs.size();
+      std::memcpy(pos, rhs.data(), rhs.size());
+      return sha256(buf, sizeof(buf));
    }
 
-   PrivateKey privateKeyFromString(std::string_view s)
+   void Merkle::push_impl(const Checksum256& value)
    {
-      if (s.substr(0, 7) == "PVT_K1_")
-         return stringToKey<PrivateKey>(s.substr(7), KeyType::k1, "K1");
-      else if (s.substr(0, 7) == "PVT_R1_")
-         return stringToKey<PrivateKey>(s.substr(7), KeyType::r1, "R1");
-      else if (s.substr(0, 4) == "PVT_")
+      stack.push_back(value);
+      for (std::uint64_t x = i; (x & 1) != 0; x >>= 1)
       {
-         check(false, "Expected private key");
-         __builtin_unreachable();
+         auto end   = stack.end();
+         *(end - 2) = combine(*(end - 2), *(end - 1));
+         stack.pop_back();
       }
-      else
-      {
-         std::vector<char> whole;
-         base58ToBinary(whole, s);
-         check(whole.size() >= 5, "Expected private key");
-         whole[0] = KeyType::k1;
-         whole.erase(whole.end() - 4, whole.end());
-         return psio::convert_from_bin<PrivateKey>(whole);
-      }
+      ++i;
    }
 
-   std::string signatureToString(const Signature& signature)
+   Checksum256 Merkle::root() const
    {
-      if (signature.data.index() == KeyType::k1)
-         return keyToString(signature, "K1", "SIG_K1_");
-      else if (signature.data.index() == KeyType::r1)
-         return keyToString(signature, "R1", "SIG_R1_");
-      else
+      if (stack.empty())
+         return Checksum256{};
+      auto        iter   = stack.end();
+      auto        begin  = stack.begin();
+      Checksum256 result = *--iter;
+      while (iter != begin)
       {
-         check(false, "Expected signature");
-         __builtin_unreachable();
+         result = combine(*--iter, result);
       }
-   }
-
-   Signature signatureFromString(std::string_view s)
-   {
-      if (s.size() >= 7 && s.substr(0, 7) == "SIG_K1_")
-         return stringToKey<Signature>(s.substr(7), KeyType::k1, "K1");
-      else if (s.size() >= 7 && s.substr(0, 7) == "SIG_R1_")
-         return stringToKey<Signature>(s.substr(7), KeyType::r1, "R1");
-      else
-      {
-         check(false, "Expected signature");
-         __builtin_unreachable();
-      }
+      return result;
    }
 }  // namespace psibase

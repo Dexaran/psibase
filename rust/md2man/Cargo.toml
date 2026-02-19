@@ -1,0 +1,15 @@
+[package]
+name = "md2man"
+version.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Generate man page from markdown"
+license.workspace = true
+
+[dependencies]
+pulldown-cmark = "0.9"
+clap.workspace = true
+psibase-rust-workspace-hack.workspace = true

@@ -2,6 +2,8 @@
 
 #include <psibase/block.hpp>
 
+#include <psio/chrono.hpp>
+
 namespace psibase
 {
    struct InnerTrace;
@@ -12,14 +14,15 @@ namespace psibase
       Action                     action;
       std::vector<char>          rawRetval;  // TODO: Move to receipt?
       std::vector<InnerTrace>    innerTraces;
+      std::chrono::nanoseconds   totalTime;  // includes time in inner actions
       std::optional<std::string> error;
    };
-   PSIO_REFLECT(ActionTrace, action, rawRetval, innerTraces, error)
+   PSIO_REFLECT(ActionTrace, action, rawRetval, innerTraces, totalTime, error)
 
    // TODO: need event definitions in ABI
    struct EventTrace
    {
-      std::string       name;  // TODO: eosio::name?
+      std::string       name;
       std::vector<char> data;
    };
    PSIO_REFLECT(EventTrace, name, data)

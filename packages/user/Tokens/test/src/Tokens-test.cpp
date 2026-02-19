@@ -1,0 +1,993 @@
+#include <catch2/catch_all.hpp>
+#include <psibase/DefaultTestChain.hpp>
+#include <psibase/MethodNumber.hpp>
+#include <psibase/checkSchema.hpp>
+#include <psibase/testUtils.hpp>
+#include <services/system/commonErrors.hpp>
+#include <services/user/RTokens.hpp>
+#include <services/user/Tokens.hpp>
+
+#include "services/user/Symbol.hpp"
+#include "services/user/tokenTypes.hpp"
+
+using namespace psibase;
+using namespace psibase::benchmarking;
+using UserService::Tokens;
+using namespace UserService::Errors;
+using namespace UserService;
+
+namespace
+{
+   constexpr bool inflationLimitsImplemented    = false;
+   constexpr bool eventEmissionTestingSupported = false;
+   constexpr bool customTokensSupported         = false;
+
+   const psibase::Memo memo{"memo"};
+
+}  // namespace
+
+SCENARIO("Using system token")
+{
+   GIVEN("An empty chain with user Alice")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+
+      auto     sysIssuer = t.from(Symbol::service).to<Tokens>();
+      Quantity userBalance{1'000'000'00e4};
+
+      uint32_t sysToken = sysIssuer.create(Precision{4}, 1'000'000'000e4).returnVal();
+      REQUIRE(t.from(Symbol::service)
+                  .to<Nft>()
+                  .debit(sysIssuer.getToken(sysToken).returnVal().nft_id, "")
+                  .succeeded());
+      t.from(Tokens::service).to<Tokens>().setSysToken(sysToken);
+      CHECK(sysIssuer.mint(sysToken, userBalance, memo).succeeded());
+
+      sysIssuer.setTokenConf(sysToken, Tokens::untransferable, true);
+
+      THEN("The system token is untradeable by default")
+      {
+         auto isUntradeable = a.getTokenConf(sysToken, Tokens::untransferable);
+         CHECK(isUntradeable.succeeded());
+         CHECK(isUntradeable.returnVal() == true);
+      }
+      THEN("The system token issuer is able to credit the system token")
+      {
+         CHECK(sysIssuer.credit(sysToken, alice, userBalance, memo).succeeded());
+      }
+      sysIssuer.credit(sysToken, alice, userBalance, memo);
+
+      THEN("Alice cannot credit system tokens to anyone")
+      {
+         CHECK(a.credit(sysToken, bob, userBalance / 2, memo).failed(tokenUntradeable));
+      }
+
+      THEN("The issuer is able to make the token tradeable")
+      {
+         CHECK(sysIssuer.setTokenConf(sysToken, Tokens::untransferable, false).succeeded());
+
+         AND_THEN("Alice may credit system tokens to anyone")
+         {
+            CHECK(a.credit(sysToken, bob, userBalance / 2, memo).succeeded());
+         }
+         AND_THEN("Alice may not credit the system token to herself")
+         {
+            CHECK(a.credit(sysToken, alice, userBalance / 2, memo).failed(senderIsReceiver));
+         }
+      }
+   }
+}
+
+SCENARIO("Creating a token")
+{
+   GIVEN("An empty chain with user Alice")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+
+      THEN("Alice may create a token")
+      {
+         auto create = a.create(Precision{4}, 1'000'000'000e4);
+         CHECK(create.succeeded());
+
+         AND_THEN("The token exists")
+         {
+            auto tokenId = create.returnVal();
+            CHECK(a.getToken(tokenId).succeeded());
+            AND_THEN("The tokenId is not 0")
+            {  //
+               CHECK(tokenId != 0);
+            }
+         }
+      }
+      THEN("Alice may not create a token with invalid quantity")
+      {
+         auto     p = Precision{4};
+         Quantity q0{0e4};
+         Quantity q1{1e4};
+         Quantity q2{std::numeric_limits<Quantity::Quantity_t>::max()};
+         CHECK(a.create(p, q0).failed(Errors::supplyGt0));
+         CHECK(a.create(p, q1).succeeded());
+         CHECK(a.create(p, q2).succeeded());
+      }
+      WHEN("Alice creates a token")
+      {
+         auto tokenId = a.create(Precision{4}, 1'000'000'000e4).returnVal();
+         auto token1  = a.getToken(tokenId).returnVal();
+
+         THEN("Alice may create a second token")
+         {
+            auto create = a.create(Precision{4}, 1'000'000'000e4);
+            CHECK(create.succeeded());
+
+            auto tokenId   = create.returnVal();
+            auto getToken2 = a.getToken(tokenId);
+            CHECK(getToken2.succeeded());
+
+            auto token2 = getToken2.returnVal();
+
+            AND_THEN("The owner NFT is different from the first token owner NFT")
+            {
+               CHECK(token1.nft_id != token2.nft_id);
+            }
+         }
+      }
+   }
+}
+
+SCENARIO("Minting tokens")
+{
+   GIVEN("Alice created a token")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+      auto b     = bob.to<Tokens>();
+
+      auto tokenId = a.create(Precision{4}, 1'000'000'000e4).returnVal();
+
+      THEN("Bob may not mint them")
+      {
+         auto mint = b.mint(tokenId, 1'000e4, memo);
+         CHECK(mint.failed(missingRequiredAuth));
+      }
+      THEN("Alice may not mint them with a nonexistent token ID")
+      {
+         auto mint = a.mint(999, 1'000e4, memo);
+         CHECK(mint.failed(tokenDNE));
+      }
+      THEN("Alice may not mint more tokens than are allowed by the specified max issued supply")
+      {
+         CHECK(a.mint(tokenId, 1'000'000'001e4, memo).failed(maxSupplyExceeded));
+      }
+      THEN("Alice may mint new tokens")
+      {
+         Quantity quantity{1'000e4};
+         auto     mint = a.mint(tokenId, quantity, memo);
+         CHECK(mint.succeeded());
+
+         AND_THEN("The tokens were allocated accordingly")
+         {
+            auto getBalance = a.getBalance(tokenId, alice);
+            CHECK(getBalance.succeeded());
+            CHECK(getBalance.returnVal().value == quantity);
+         }
+      }
+   }
+
+   GIVEN("A token created by Alice with inflation limits")
+   {
+      //CHECK(inflationLimitsImplemented);
+
+      THEN("Alice may not exceed those inflation limits")
+      {  //
+         //CHECK(inflationLimitsImplemented);
+      }
+      THEN("Alice may not raise those inflation limits")
+      {  //
+         //CHECK(inflationLimitsImplemented);
+      }
+   }
+}
+
+SCENARIO("Recalling tokens")
+{
+   GIVEN("Alice created a new token and issued some to Bob")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+      auto b     = bob.to<Tokens>();
+
+      auto tokenId = a.create(Precision{4}, 1'000'000'000e4).returnVal();
+      auto token   = a.getToken(tokenId).returnVal();
+      a.mint(tokenId, 1'000e4, memo);
+      a.credit(tokenId, bob, 1'000e4, memo);
+
+      THEN("The token is recallable by default")
+      {
+         CHECK(a.getTokenConf(tokenId, Tokens::unrecallable).returnVal() == false);
+      }
+      THEN("Alice can recall Bob's tokens")
+      {
+         auto recall = a.recall(tokenId, bob, 1'000e4, memo);
+         CHECK(recall.succeeded());
+
+         AND_THEN("Bob's token balance has decreased")
+         {
+            CHECK(a.getBalance(tokenId, bob).returnVal().value == 0);
+         }
+         AND_THEN("Alice's token balance has not changed")
+         {
+            CHECK(a.getBalance(tokenId, alice).returnVal().value == 0);
+         }
+      }
+      THEN("The token issuer may turn off recallability")
+      {
+         CHECK(a.setTokenConf(tokenId, Tokens::unrecallable, true).succeeded());
+
+         CHECK(a.getTokenConf(tokenId, Tokens::unrecallable).returnVal());
+
+         AND_THEN("Alice may not recall Bob's tokens")
+         {
+            CHECK(a.recall(tokenId, bob, 1'000e4, memo).failed(tokenUnrecallable));
+         }
+         AND_THEN("The token issuer may not re-enable recallability")
+         {
+            CHECK(a.setTokenConf(tokenId, Tokens::unrecallable, false).failed(invalidConfigUpdate));
+         }
+      }
+   }
+}
+
+SCENARIO("Interactions with the Issuer NFT")
+{
+   GIVEN("Alice created and distributed a token")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+      auto b     = bob.to<Tokens>();
+
+      auto tokenId = a.create(Precision{4}, 1'000'000'000e4).returnVal();
+      auto token   = a.getToken(tokenId).returnVal();
+      auto nft     = alice.to<Nft>().getNft(token.nft_id).returnVal();
+
+      THEN("The Issuer NFT is owned by Alice")
+      {
+         CHECK(nft.owner == alice.id);
+      }
+      WHEN("Alice credits the issuer NFT to Bob")
+      {
+         alice.to<Nft>().credit(nft.id, bob, memo);
+
+         THEN("The NFT is owned by Bob")
+         {
+            auto newNft = alice.to<Nft>().getNft(token.nft_id).returnVal();
+            nft.owner   = bob.id;
+            CHECK((newNft.id == nft.id && newNft.issuer == nft.issuer  //
+                   && newNft.owner == nft.owner));
+            // Todo - Use simple comparison once eventHeadId moves out of Nft record.
+         }
+         THEN("The token record is identical")
+         {  //
+            CHECK(a.getToken(tokenId).returnVal() == token);
+         }
+         THEN("Bob may mint new tokens")
+         {  //
+            CHECK(b.mint(tokenId, 1'000e4, memo).succeeded());
+         }
+         THEN("Alice may not mint new tokens")
+         {
+            CHECK(a.mint(tokenId, 1'000e4, memo).failed(missingRequiredAuth));
+         }
+         THEN("Alice may not recall Bob's tokens")
+         {
+            b.mint(tokenId, 1'000e4, memo);
+            CHECK(a.recall(tokenId, bob, 1'000e4, memo).failed(missingRequiredAuth));
+         }
+         THEN("Bob may recall Alice's tokens")
+         {
+            Quantity q{1'000e4};
+            b.mint(tokenId, q, memo);
+            b.credit(tokenId, alice, q, memo);
+            CHECK(b.recall(tokenId, alice, q, memo).succeeded());
+         }
+      }
+      WHEN("Alice burns the issuer NFT")
+      {
+         Quantity quantity{1'000e4};
+         a.mint(tokenId, quantity, memo);
+         a.credit(tokenId, bob, quantity, memo);
+         alice.to<Nft>().burn(nft.id);
+
+         THEN("Alice may not mint new tokens")
+         {
+            CHECK(a.mint(tokenId, quantity, memo).failed(nftBurned));
+         }
+         THEN("Alice may not credit the issuer NFT to anyone")
+         {
+            CHECK(alice.to<Nft>().credit(nft.id, bob, memo).failed(nftBurned));
+         }
+         THEN("Alice may not recall Bob's tokens")
+         {
+            CHECK(a.recall(tokenId, bob, quantity, memo).failed(nftBurned));
+         }
+         THEN("Alice may not update the token inflation")
+         {  //
+            // CHECK(inflationLimitsImplemented);
+         }
+         THEN("Alice may not update the token recallability")
+         {
+            CHECK(a.setTokenConf(tokenId, Tokens::unrecallable, true).failed(nftBurned));
+         }
+      }
+   }
+}
+
+SCENARIO("Burning tokens")
+{
+   GIVEN("A chain with users Alice and Bob, who each own 100 tokens")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+      auto b     = bob.to<Tokens>();
+
+      auto tokenId = a.create(Precision{4}, 1'000'000'000e4).returnVal();
+      auto token   = a.getToken(tokenId).returnVal();
+      auto mint    = a.mint(tokenId, 200e4, memo);
+      a.credit(tokenId, bob, 100e4, memo);
+
+      THEN("Alice may not burn 101 tokens")
+      {
+         CHECK(a.burn(tokenId, 101e4, memo).failed(insufficientBalance));
+      }
+      THEN("Alice may burn 60 tokens")
+      {
+         CHECK(a.burn(tokenId, 60e4, memo).succeeded());
+
+         AND_THEN("Alice may not burn 41 more")
+         {
+            CHECK(a.burn(tokenId, 41e4, memo).failed(insufficientBalance));
+         }
+         AND_THEN("Alice may burn 40 more")
+         {  //
+            CHECK(a.burn(tokenId, 40e4, memo).succeeded());
+         }
+      }
+      WHEN("Alice burns 60 tokens")
+      {
+         a.burn(tokenId, 60e4, memo);
+
+         THEN("She still owns 40 tokens")
+         {  //
+            CHECK(a.getBalance(tokenId, alice).returnVal().value == 40e4);
+         }
+         THEN("Bob still owns 100 tokens")
+         {  //
+            CHECK(b.getBalance(tokenId, bob).returnVal().value == 100e4);
+         }
+      }
+      WHEN("Alice burns 100 tokens")
+      {
+         a.burn(tokenId, 100e4, memo);
+
+         THEN("Her balance is 0")
+         {  //
+            CHECK(a.getBalance(tokenId, alice).returnVal().value == 0e4);
+         }
+         THEN("She may not burn any more")
+         {
+            CHECK(a.burn(tokenId, 1e4, memo).failed(insufficientBalance));
+         }
+         THEN("Bob may burn tokens")
+         {  //
+            CHECK(b.burn(tokenId, 10e4, memo).succeeded());
+         }
+         AND_WHEN("Bob burns 10 tokens")
+         {
+            b.burn(tokenId, 10e4, memo);
+
+            THEN("Bob still has 90 tokens")
+            {  //
+               CHECK(b.getBalance(tokenId, bob).returnVal().value == 90e4);
+            }
+            THEN("Alice still has 0 tokens")
+            {  //
+               CHECK(a.getBalance(tokenId, alice).returnVal().value == 0e4);
+            }
+         }
+      }
+   }
+}
+
+SCENARIO("Toggling manual-debit")
+{
+   GIVEN("A chain with users Alice and Bob")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+      auto b     = bob.to<Tokens>();
+
+      THEN("Alice and Bob both have manualDebit disabled")
+      {
+         auto isManualDebit1 = a.getUserConf(alice, Tokens::manualDebit);
+         REQUIRE(isManualDebit1.succeeded());
+         CHECK(isManualDebit1.returnVal() == false);
+
+         auto isManualDebit2 = a.getUserConf(bob, Tokens::manualDebit);
+         REQUIRE(isManualDebit2.succeeded());
+         CHECK(isManualDebit2.returnVal() == false);
+      }
+      THEN("Alice may enable manual-debit")
+      {  //
+         CHECK(a.setUserConf(Tokens::manualDebit, true).succeeded());
+      }
+      WHEN("Alice enabled manual-debit")
+      {
+         a.setUserConf(Tokens::manualDebit, true);
+
+         THEN("Alice has manual-debit enabled")
+         {  //
+            CHECK(a.getUserConf(alice, Tokens::manualDebit).returnVal() == true);
+         }
+         THEN("Bob still has manual-debit disabled")
+         {  //
+            CHECK(a.getUserConf(bob, Tokens::manualDebit).returnVal() == false);
+         }
+         THEN("Alice may enable manual-debit again. Idempotent.")
+         {
+            CHECK(a.setUserConf(Tokens::manualDebit, true).succeeded());
+
+            AND_THEN("But Bob may enable manual-debit")
+            {  //
+               CHECK(b.setUserConf(Tokens::manualDebit, true).succeeded());
+            }
+         }
+         THEN("Alice may disable manual-debit")
+         {  //
+            CHECK(a.setUserConf(Tokens::manualDebit, false).succeeded());
+
+            AND_THEN("Alice has manual-debit disabled")
+            {  //
+               CHECK(a.getUserConf(alice, Tokens::manualDebit).returnVal() == false);
+            }
+            AND_THEN("Bob still has manual-debit disabled")
+            {
+               CHECK(a.getUserConf(bob, Tokens::manualDebit).returnVal() == false);
+            }
+         }
+      }
+   }
+}
+
+SCENARIO("Crediting/uncrediting/debiting tokens")
+{
+   GIVEN("A chain with users Alice and Bob, who each own 100 tokens")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+      auto b     = bob.to<Tokens>();
+
+      auto tokenId = a.create(Precision{4}, 1'000'000'000e4).returnVal();
+      auto token   = a.getToken(tokenId).returnVal();
+      auto mint    = a.mint(tokenId, 200e4, memo);
+      a.credit(tokenId, bob, 100e4, memo);
+
+      THEN("Alice may not credit Bob 101 tokens")
+      {
+         CHECK(a.credit(tokenId, bob, 101e4, memo).failed(insufficientBalance));
+      }
+      THEN("Alice may credit Bob 100 tokens")
+      {
+         CHECK(a.credit(tokenId, bob, 100e4, memo).succeeded());
+      }
+      WHEN("Alice credits Bob 100 tokens")
+      {
+         a.credit(tokenId, bob, 100e4, memo);
+
+         THEN("Bob immediately has 200 tokens")
+         {  //
+            CHECK(b.getBalance(tokenId, bob).returnVal().value == 200e4);
+         }
+         THEN("Alice immediately has 0 tokens")
+         {  //
+            CHECK(a.getBalance(tokenId, alice).returnVal().value == 0e4);
+         }
+         THEN("Alice may not credit Bob 1 token")
+         {
+            CHECK(a.credit(tokenId, bob, 1e4, memo).failed(insufficientBalance));
+         }
+         THEN("Bob may not debit any tokens")
+         {
+            CHECK(b.debit(tokenId, alice, 1e4, memo).failed(missingSharedBalance));
+         }
+         THEN("Alice may not uncredit any tokens")
+         {
+            CHECK(a.uncredit(tokenId, bob, 1e4, memo).failed(missingSharedBalance));
+         }
+         THEN("Bob may credit Alice 10 tokens")
+         {
+            CHECK(b.credit(tokenId, alice, 10e4, memo).succeeded());
+         }
+         AND_WHEN("Bob credits Alice 10 tokens")
+         {
+            b.credit(tokenId, alice, 10e4, memo);
+
+            THEN("Bob has 190 tokens")
+            {  //
+               CHECK(b.getBalance(tokenId, bob).returnVal().value == 190e4);
+            }
+            THEN("Alice has 10 tokens")
+            {  //
+               CHECK(a.getBalance(tokenId, alice).returnVal().value == 10e4);
+            }
+         }
+      }
+   }
+}
+
+SCENARIO("Crediting/uncrediting/debiting tokens, with manual-debit")
+{
+   GIVEN("A chain with users Alice and Bob, who each own 100 tokens")
+   {
+      DefaultTestChain t;
+
+      auto alice = t.from(t.addAccount("alice"_a));
+      auto a     = alice.to<Tokens>();
+      auto bob   = t.from(t.addAccount("bob"_a));
+      auto b     = bob.to<Tokens>();
+
+      auto tokenId = a.create(Precision{4}, 1'000'000'000e4).returnVal();
+      auto token   = a.getToken(tokenId).returnVal();
+
+      a.mint(tokenId, 200e4, memo);
+      a.credit(tokenId, bob, 100e4, memo);
+
+      AND_GIVEN("Alice turns on manual-debit")
+      {
+         a.setUserConf(Tokens::manualDebit, true);
+
+         THEN("Alice may credit Bob 50 tokens")
+         {
+            CHECK(a.credit(tokenId, bob, 50e4, memo).succeeded());
+         }
+         THEN("Bob may credit Alice 50 tokens")
+         {
+            CHECK(b.credit(tokenId, alice, 50e4, memo).succeeded());
+         }
+         WHEN("Alice credits Bob 50 tokens")
+         {
+            a.credit(tokenId, bob, 50e4, memo);
+
+            THEN("The transfer happens immediately")
+            {
+               CHECK(150e4 == b.getBalance(tokenId, bob).returnVal().value);
+               CHECK(50e4 == a.getBalance(tokenId, alice).returnVal().value);
+            }
+            THEN("Alice and Bob may not uncredit any tokens")
+            {
+               CHECK(a.uncredit(tokenId, bob, 50e4, memo).failed(missingSharedBalance));
+               CHECK(b.uncredit(tokenId, alice, 50e4, memo).failed(missingSharedBalance));
+            }
+            THEN("Alice and Bob may not debit any tokens")
+            {
+               CHECK(a.debit(tokenId, bob, 50e4, memo).failed(missingSharedBalance));
+               CHECK(b.debit(tokenId, alice, 50e4, memo).failed(missingSharedBalance));
+            }
+         }
+         WHEN("Bob credits Alice 50 tokens")
+         {
+            b.credit(tokenId, alice, 50e4, memo);
+
+            THEN("Bob owns 50 tokens in his individual balance")
+            {
+               CHECK(50e4 == b.getBalance(tokenId, bob).returnVal().value);
+               AND_THEN("Bob owns 50 tokens in his shared balance with Alice")
+               {
+                  CHECK(50e4 == b.getSharedBal(tokenId, bob, alice).returnVal().value);
+               }
+            }
+            THEN("Bob may try to uncredit 51 tokens, but will only uncredit 50")
+            {
+               CHECK(50e4 == b.getBalance(tokenId, bob).returnVal().value);
+               CHECK(b.uncredit(tokenId, alice, 51e4, memo).succeeded());
+               CHECK(100e4 == b.getBalance(tokenId, bob).returnVal().value);
+            }
+            THEN("Bob may uncredit 25 tokens")
+            {
+               CHECK(b.uncredit(tokenId, alice, 25e4, memo).succeeded());
+
+               AND_THEN("Bob may uncredit 25 tokens")
+               {
+                  CHECK(b.uncredit(tokenId, alice, 25e4, memo).succeeded());
+                  AND_THEN("Bob owns 0 tokens in his shared balance with Alice")
+                  {
+                     CHECK(0e4 == b.getSharedBal(tokenId, bob, alice).returnVal().value);
+
+                     AND_THEN("Bob may not uncredit any tokens")
+                     {
+                        CHECK(b.uncredit(tokenId, alice, 1e4, memo).failed(missingSharedBalance));
+                     }
+                  }
+               }
+               AND_THEN("Alice may not debit 26 tokens")
+               {
+                  CHECK(a.debit(tokenId, bob, 26e4, memo).failed(insufficientSharedBalance));
+               }
+               AND_THEN("Alice may debit 25 tokens")
+               {
+                  CHECK(a.debit(tokenId, bob, 25e4, memo).succeeded());
+                  AND_THEN("Bob has 0 tokens in his shared balance with Alice")
+                  {
+                     CHECK(0e4 == b.getSharedBal(tokenId, bob, alice).returnVal().value);
+                  }
+                  AND_THEN("Bob owns 75 tokens in his individual balance")
+                  {
+                     CHECK(75e4 == b.getBalance(tokenId, bob).returnVal().value);
+                  }
+                  AND_THEN("Alice owns 125 tokens in her individual balance")
+                  {
+                     CHECK(125e4 == a.getBalance(tokenId, alice).returnVal().value);
+                  }
+               }
+            }
+            THEN("Alice may not debit 51 tokens")
+            {
+               CHECK(a.debit(tokenId, bob, 51e4, memo).failed(insufficientSharedBalance));
+            }
+            THEN("Alice may debit 50 tokens")
+            {
+               CHECK(a.debit(tokenId, bob, 50e4, memo).succeeded());
+               AND_THEN("Alice may not debit any more tokens")
+               {
+                  CHECK(a.debit(tokenId, bob, 1e4, memo).failed(missingSharedBalance));
+               }
+               AND_THEN("Bob may not uncredit any more tokens")
+               {
+                  CHECK(b.uncredit(tokenId, alice, 1e4, memo).failed(missingSharedBalance));
+               }
+               AND_THEN("Bob may credit an additional 25 tokens")
+               {
+                  CHECK(b.credit(tokenId, alice, 25e4, memo).succeeded());
+               }
+            }
+         }
+      }
+   }
+}
+
+SCENARIO("Mapping a symbol to a token")
+{
+   GIVEN("Alice has created a token and created a symbol")
+   {
+      DefaultTestChain t;
+
+      auto alice       = t.from(t.addAccount("alice"_a));
+      auto bob         = t.from(t.addAccount("bob"_a));
+      auto aliceTokens = alice.to<Tokens>();
+      auto aliceSymbol = alice.to<Symbol>();
+      auto bobTokens   = bob.to<Tokens>();
+      auto bobSymbol   = bob.to<Symbol>();
+
+      // Issue system tokens
+      auto sysIssuer   = t.from(Symbol::service).to<Tokens>();
+      auto userBalance = 1'000'000e4;
+      auto sysToken    = sysIssuer.create(Precision{4}, userBalance).returnVal();
+
+      REQUIRE(t.from(Symbol::service)
+                  .to<Nft>()
+                  .debit(sysIssuer.getToken(sysToken).returnVal().nft_id, "")
+                  .succeeded());
+
+      REQUIRE(sysIssuer.setTokenConf(sysToken, Tokens::untransferable, false).succeeded());
+      REQUIRE(sysIssuer.mint(sysToken, userBalance, memo).succeeded());
+      REQUIRE(t.from(Tokens::service).to<Tokens>().setSysToken(sysToken).succeeded());
+      REQUIRE(t.from(Symbol::service).to<Symbol>().sellLength(3, 10000000, 24, 5000).succeeded());
+      sysIssuer.credit(sysToken, alice, userBalance, memo);
+
+      // Mint a second token
+      auto newToken = aliceTokens.create(Precision{4}, userBalance).returnVal();
+      aliceTokens.mint(newToken, userBalance, memo);
+
+      auto symbolCtx = t.from("symbol"_a);
+
+      // Purchase the symbol and claim the owner NFT
+      auto symbolCost = alice.to<Symbol>().getPrice(3).returnVal();
+      aliceTokens.credit(sysToken, Symbol::service, symbolCost, memo);
+      auto symbolId = "abc"_a;
+      auto create   = alice.to<Symbol>().create(symbolId);
+      CHECK(create.succeeded());
+      auto symbolRecord = alice.to<Symbol>().getSymbol(symbolId).returnVal();
+      auto nftId        = symbolRecord.ownerNft;
+
+      THEN("Bob is unable to map the symbol to the token")
+      {
+         CHECK(bobSymbol.mapSymbol(newToken, symbolId).failed(missingRequiredAuth));
+      }
+      WHEN("Alice burns the symbol owner NFT")
+      {
+         CHECK(alice.to<Nft>().burn(nftId).succeeded());
+
+         THEN("Alice is unable to map the symbol to the token")
+         {
+            CHECK(aliceSymbol.mapSymbol(newToken, symbolId).failed(nftBurned));
+         }
+      }
+      WHEN("Alice burns the token owner NFT")
+      {
+         auto tokenNft = aliceTokens.getToken(newToken).returnVal().nft_id;
+         alice.to<Nft>().burn(tokenNft);
+
+         THEN("Alice is unable to map the symbol to the token")
+         {
+            CHECK(aliceSymbol.mapSymbol(newToken, symbolId).failed(nftBurned));
+         }
+      }
+      THEN("Alice is unable to map a symbol to a nonexistent token")
+      {
+         TID invalidTokenId = 999;
+         CHECK(aliceSymbol.mapSymbol(invalidTokenId, symbolId).failed(tokenDNE));
+      }
+      THEN("Alice is unable to map a nonexistent symbol to a token")
+      {
+         SID invalidSymbolId = "zzz"_a;
+         CHECK(aliceSymbol.mapSymbol(newToken, invalidSymbolId).failed(symbolDNE));
+      }
+      THEN("Alice is able to map the symbol to the token")
+      {
+         alice.to<Nft>().credit(nftId, Symbol::service, memo);
+         CHECK(aliceSymbol.mapSymbol(newToken, symbolId).succeeded());
+
+         AND_THEN("The token ID mapping exists")
+         {
+            CHECK(aliceSymbol.getTokenSym(newToken).returnVal() == symbolId);
+         }
+      }
+      WHEN("Alice maps the symbol to the token")
+      {
+         alice.to<Nft>().credit(nftId, Tokens::service, memo);
+         aliceSymbol.mapSymbol(newToken, symbolId);
+
+         THEN("The symbol record is identical")
+         {
+            auto symbolRecord2 = alice.to<Symbol>().getSymbol(symbolId).returnVal();
+            CHECK(symbolRecord == symbolRecord2);
+         }
+
+         THEN("Alice may not map a new symbol to the same token")
+         {
+            CHECK(aliceTokens.credit(sysToken, Symbol::service, symbolCost, memo).succeeded());
+            auto newSymbol = "bcd"_a;
+            alice.to<Symbol>().create(newSymbol);
+            auto newNft = alice.to<Symbol>().getSymbol(newSymbol).returnVal().ownerNft;
+
+            CHECK(alice.to<Nft>().credit(newNft, Symbol::service, memo).succeeded());
+            CHECK(aliceSymbol.mapSymbol(newToken, newSymbol).succeeded());
+         }
+      }
+   }
+}
+
+TEST_CASE("Reading emitted events")
+{
+   //CHECK(eventEmissionTestingSupported);
+}
+
+TEST_CASE("Testing custom tokens")
+{
+   // Test a custom token service that uses the main token service
+   //    hooks to customize distribution or other behavior.
+   //CHECK(customTokensSupported);
+
+   GIVEN("A custom token service")
+   {
+      THEN("It can't register with the main token service without the token owner NFT") {}
+      THEN("It can register with the token service if it does own the token owner NFT")
+      {
+         AND_THEN("Storage costs are updated accordingly") {}
+      }
+      WHEN("It registers with the main token service")
+      {  //
+         // Verify that all the various hooks can be called.
+      }
+   }
+}
+
+TEST_CASE("GraphQL Queries")
+{
+   DefaultTestChain t;
+
+   auto symbolCtx = t.from("symbol"_a);
+
+   auto alice = t.from(t.addAccount("alice"_a));
+   auto a     = alice.to<Tokens>();
+   auto bob   = t.from(t.addAccount("bob"_a));
+
+   auto sysIssuer = t.from(Symbol::service).to<Tokens>();
+   auto sysToken  = sysIssuer.create(Precision{4}, 1'000'000'000e4).returnVal();
+   t.from(Symbol::service).to<Nft>().debit(sysIssuer.getToken(sysToken).returnVal().nft_id, "");
+   t.from(Tokens::service).to<Tokens>().setSysToken(sysToken);
+
+   auto userBalance = 1'000'000e4;
+
+   sysIssuer.mint(sysToken, userBalance, memo);
+
+   REQUIRE(sysIssuer.credit(sysToken, alice, userBalance, memo).succeeded());
+   REQUIRE(sysIssuer.setTokenConf(sysToken, Tokens::untransferable, false).succeeded());
+   t.finishBlock();
+
+   auto token_a = t.login(alice, Tokens::service);
+   auto token_b = t.login(bob, Tokens::service);
+
+   auto userBalances = t.post(
+       Tokens::service, "/graphql",
+       GraphQLBody{
+           R"( query { userBalances(user: "alice") { edges { node { symbol tokenId precision balance } } } } )"},
+       token_a);
+
+   CHECK(
+       std::string(userBalances.body.begin(), userBalances.body.end()) ==
+       R"({"data":{"userBalances":{"edges":[{"node":{"symbol":null,"tokenId":1,"precision":4,"balance":"1000000.0000"}}]}}})");
+
+   REQUIRE(alice.to<Tokens>().credit(sysToken, bob, 500e4, memo).succeeded());
+   REQUIRE(alice.to<Tokens>().setUserConf(Tokens::manualDebit, true).succeeded());
+   REQUIRE(bob.to<Tokens>().setUserConf(Tokens::manualDebit, true).succeeded());
+   REQUIRE(alice.to<Tokens>().credit(sysToken, bob, 1'000e4, memo).succeeded());
+   REQUIRE(bob.to<Tokens>().credit(sysToken, alice, 200e4, memo).succeeded());
+
+   auto userPendingRes =
+       R"({"data":{"userPending":{"edges":[{"node":{"sharedBal":{"symbol":null,"tokenId":1,"precision":4,"balance":"1000.0000","creditor":"alice","debitor":"bob"}}},{"node":{"sharedBal":{"symbol":null,"tokenId":1,"precision":4,"balance":"200.0000","creditor":"bob","debitor":"alice"}}}]}}})";
+
+   auto userPending = t.post(
+       Tokens::service, "/graphql",
+       GraphQLBody{std::format(
+           R"( query {{ userPending(user: "alice", tokenId: {}) {{ edges {{ node {{ sharedBal {{ symbol tokenId precision balance creditor debitor }} }} }} }} }} )",
+           sysToken)},
+       token_a);
+   CHECK(std::string(userPending.body.begin(), userPending.body.end()) == userPendingRes);
+
+   userPending = t.post(
+       Tokens::service, "/graphql",
+       GraphQLBody{std::format(
+           R"( query {{ userPending(user: "bob", tokenId: {}) {{ edges {{ node {{ sharedBal {{ symbol tokenId precision balance creditor debitor }} }} }} }} }} )",
+           sysToken)},
+       token_b);
+   CHECK(std::string(userPending.body.begin(), userPending.body.end()) == userPendingRes);
+
+   auto userTokens = t.post(
+       Tokens::service, "/graphql",
+       GraphQLBody{
+           R"( query { userTokens(user: "symbol") { id precision issuedSupply maxIssuedSupply symbol } } )"});
+   CHECK(
+       std::string(userTokens.body.begin(), userTokens.body.end()) ==
+       R"({"data":{"userTokens":[{"id":1,"precision":4,"issuedSupply":"1000000.0000","maxIssuedSupply":"1000000000.0000","symbol":null}]}})");
+}
+
+TEST_CASE("Decimal")
+{
+   auto create_asset = [](uint64_t quantity, uint8_t precision) -> Decimal
+   { return Decimal{Quantity{quantity}, Precision{precision}}; };
+
+   SECTION("precision 0")
+   {
+      CHECK(create_asset(40000, 0).str() == "40000");
+      CHECK(create_asset(1, 0).str() == "1");
+      CHECK(create_asset(0, 0).str() == "0");
+   }
+
+   SECTION("precision 1")
+   {
+      CHECK(create_asset(4000, 1).str() == "400.0");
+      CHECK(create_asset(1, 1).str() == "0.1");
+      CHECK(create_asset(0, 1).str() == "0.0");
+   }
+
+   SECTION("precision 2")
+   {
+      CHECK(create_asset(40000, 2).str() == "400.00");
+      CHECK(create_asset(1, 2).str() == "0.01");
+      CHECK(create_asset(0, 2).str() == "0.00");
+   }
+
+   SECTION("precision 3")
+   {
+      CHECK(create_asset(400000, 3).str() == "400.000");
+      CHECK(create_asset(1, 3).str() == "0.001");
+      CHECK(create_asset(123, 3).str() == "0.123");
+      CHECK(create_asset(0, 3).str() == "0.000");
+   }
+
+   SECTION("precision 4")
+   {
+      CHECK(create_asset(40000, 4).str() == "4.0000");
+      CHECK(create_asset(1, 4).str() == "0.0001");
+      CHECK(create_asset(12345, 4).str() == "1.2345");
+      CHECK(create_asset(0, 4).str() == "0.0000");
+   }
+
+   SECTION("precision 5")
+   {
+      CHECK(create_asset(400000, 5).str() == "4.00000");
+      CHECK(create_asset(1, 5).str() == "0.00001");
+      CHECK(create_asset(54321, 5).str() == "0.54321");
+      CHECK(create_asset(0, 5).str() == "0.00000");
+   }
+
+   SECTION("precision 6")
+   {
+      CHECK(create_asset(4000000, 6).str() == "4.000000");
+      CHECK(create_asset(1, 6).str() == "0.000001");
+      CHECK(create_asset(123456, 6).str() == "0.123456");
+      CHECK(create_asset(0, 6).str() == "0.000000");
+   }
+
+   SECTION("precision 7")
+   {
+      CHECK(create_asset(4000000, 7).str() == "0.4000000");
+      CHECK(create_asset(1, 7).str() == "0.0000001");
+      CHECK(create_asset(123456, 7).str() == "0.0123456");
+      CHECK(create_asset(0, 7).str() == "0.0000000");
+   }
+
+   SECTION("precision 8")
+   {
+      CHECK(create_asset(4000000, 8).str() == "0.04000000");
+      CHECK(create_asset(1, 8).str() == "0.00000001");
+      CHECK(create_asset(123456, 8).str() == "0.00123456");
+      CHECK(create_asset(0, 8).str() == "0.00000000");
+   }
+
+   SECTION("large quantity")
+   {
+      CHECK(create_asset(UINT64_MAX, 0).str() == "18446744073709551615");
+      CHECK(create_asset(UINT64_MAX, 8).str() == "184467440737.09551615");
+      CHECK(create_asset(1000000000000000000ULL, 2).str() == "10000000000000000.00");
+   }
+
+   SECTION("fromStr parsing")
+   {
+      CHECK(Decimal::fromStr("40000").str() == "40000");
+      CHECK(Decimal::fromStr("400.0").str() == "400.0");
+      CHECK(Decimal::fromStr("400.00").str() == "400.00");
+      CHECK(Decimal::fromStr("0.1").str() == "0.1");
+      CHECK(Decimal::fromStr("0.01").str() == "0.01");
+      CHECK(Decimal::fromStr("0.001").str() == "0.001");
+      CHECK(Decimal::fromStr("0.123").str() == "0.123");
+      CHECK(Decimal::fromStr("1.2345").str() == "1.2345");
+      CHECK(Decimal::fromStr("0.54321").str() == "0.54321");
+      CHECK(Decimal::fromStr("0.123456").str() == "0.123456");
+      CHECK(Decimal::fromStr("0.0123456").str() == "0.0123456");
+      CHECK(Decimal::fromStr("0.00123456").str() == "0.00123456");
+      CHECK(Decimal::fromStr("18446744073709551615").str() == "18446744073709551615");
+      CHECK(Decimal::fromStr("10000000000000000.00").str() == "10000000000000000.00");
+   }
+}
+
+TEST_CASE("tokens schema")
+{
+   CHECK_SCHEMA(Tokens);
+   CHECK_SCHEMA(RTokens);
+}

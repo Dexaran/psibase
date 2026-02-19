@@ -1,0 +1,17 @@
+[package]
+name = "host-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wit-bindgen-rt.workspace = true
+psibase-plugin-workspace-hack.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[package.metadata.component]
+package = "host:types"
+
+[package.metadata.component.target]
+world = "impl"

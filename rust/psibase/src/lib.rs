@@ -1,24 +1,35 @@
 mod account_number;
 mod action_template;
+mod actions;
+mod auth;
 mod block;
 mod boot;
 mod crypto;
 mod db;
+mod depgraph;
+mod flags;
 mod from_bin;
+mod graph_ql;
 mod hex;
 mod http;
 mod internal_macros;
+#[cfg(not(target_family = "wasm"))]
+mod local_socket;
+pub mod memo;
 mod method_number;
 pub mod native;
 pub mod native_raw;
 mod native_tables;
-pub mod reflect;
+mod package;
+mod plugin_error;
 #[cfg(not(target_family = "wasm"))]
 mod rpc;
 mod schema;
+pub mod semver;
 mod serve_http;
 mod service;
 pub mod services;
+mod sha256;
 mod table;
 pub mod tester;
 pub mod tester_raw;
@@ -26,37 +37,56 @@ mod time;
 mod to_bin;
 mod to_key;
 mod trace;
+mod transaction_builder;
+mod trust;
 mod web_services;
 
 pub use account_number::*;
 pub use action_template::*;
+pub use actions::*;
+pub use auth::*;
 pub use block::*;
 pub use boot::*;
 pub use crypto::*;
 pub use db::*;
+pub use depgraph::*;
+pub use flags::*;
 pub use from_bin::*;
+pub use graph_ql::*;
 pub use hex::*;
 pub use http::*;
+#[cfg(not(target_family = "wasm"))]
+pub use local_socket::*;
+pub use memo::*;
 pub use method_number::*;
 pub use native::*;
 pub use native_tables::*;
+pub use package::*;
+pub use paste;
 #[cfg(not(target_family = "wasm"))]
 pub use rpc::*;
 pub use schema::*;
+pub use semver::*;
 pub use serve_http::*;
 pub use service::*;
+pub use sha256::*;
 pub use table::*;
 pub use tester::*;
 pub use time::*;
 pub use to_bin::*;
 pub use to_key::*;
 pub use trace::*;
+pub use transaction_builder::*;
 pub use web_services::*;
 
 use internal_macros::*;
 
 pub use fracpack;
 pub use psibase_macros::*;
+
+// Re-export these to simplify use of the `trust` macro
+pub use indoc;
+pub use lazy_static;
 
 // TODO: decide on an error type. Reexporting anyhow
 // and using it as a return type of library functions

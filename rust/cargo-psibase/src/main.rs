@@ -1,29 +1,40 @@
-mod link;
-
 use anyhow::Error;
 use anyhow::{anyhow, Context};
-use binaryen::{CodegenConfig, Module};
+use cargo_metadata::semver::Version;
 use cargo_metadata::Message;
-use cargo_metadata::Metadata;
+use cargo_metadata::{DepKindInfo, DependencyKind, Metadata, NodeDep, PackageId};
 use clap::{Parser, Subcommand};
 use console::style;
-use psibase::{ExactAccountNumber, PrivateKey, PublicKey};
+use psibase::{ExactAccountNumber, PackageInfo, Schema};
 use regex::Regex;
-use std::ffi::OsString;
-use std::fs::{read, write, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::fs::{read, write, File, OpenOptions};
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{exit, Stdio};
+use std::process::{exit, ExitCode, Stdio};
 use std::{env, fs};
 use tokio::io::AsyncBufReadExt;
-use url::Url;
+use walrus::Module;
+use wasm_opt::OptimizationOptions;
+
+mod link;
+use link::link_module;
+mod package;
+use package::*;
+
+/// The version of the cargo-psibase crate at compile time
+const CARGO_PSIBASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SERVICE_ARGS: &[&str] = &["--lib", "--crate-type=cdylib"];
+const SERVICE_ARGS_RUSTC: &[&str] = &[
+    "--",
+    "-C",
+    "target-feature=+simd128,+bulk-memory,+sign-ext,+nontrapping-fptoint",
+];
 
 const SERVICE_POLYFILL: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/service_wasi_polyfill.wasm"));
-const TESTER_POLYFILL: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/tester_wasi_polyfill.wasm"));
 
 /// Build, test, and deploy psibase services
 #[derive(Parser, Debug)]
@@ -42,53 +53,65 @@ enum PsibaseCommand {
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    // TODO: load default from environment variable
-    /// API Endpoint
-    #[clap(
-        short = 'a',
-        long,
-        value_name = "URL",
-        default_value = "http://psibase.127.0.0.1.sslip.io:8080/"
-    )]
-    api: Url,
-
     /// Sign with this key (repeatable)
     #[clap(short = 's', long, value_name = "KEY")]
-    sign: Vec<PrivateKey>,
+    sign: Vec<String>,
+
+    /// Path to Cargo.toml
+    #[clap(long, global = true, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+
+    /// Directory for all generated artifacts
+    #[clap(long, global = true, value_name = "DIRECTORY")]
+    target_dir: Option<PathBuf>,
+
+    /// Path to psitest executable
+    #[clap(long, global = true, value_name = "PATH", default_value_os_t = find_psitest(), env = "CARGO_PSIBASE_PSITEST")]
+    psitest: PathBuf,
+
+    /// Path to psibase executable
+    #[clap(long, global = true, value_name = "PATH", default_value_os_t = find_psibase(), env = "CARGO_PSIBASE_PSIBASE")]
+    psibase: PathBuf,
+
+    /// Build only the specified packages
+    #[clap(short = 'p', long, global = true, value_name = "SPEC")]
+    package: Vec<String>,
 
     #[clap(subcommand)]
     command: Command,
 }
 
 #[derive(Parser, Debug)]
-struct DeployCommand {
-    /// Account to deploy service on
-    account: Option<ExactAccountNumber>,
-
-    /// Create the account if it doesn't exist. Also set the account to
-    /// authenticate using this key, even if the account already existed.
-    #[clap(short = 'c', long, value_name = "KEY")]
-    create_account: Option<PublicKey>,
-
-    /// Create the account if it doesn't exist. The account won't be secured;
-    /// anyone can authorize as this account without signing. Caution: this option
-    /// should not be used on production or public chains.
-    #[clap(short = 'i', long)]
-    create_insecure_account: bool,
-
-    /// Register the service with ProxySys. This allows the service to host a
-    /// website, serve RPC requests, and serve GraphQL requests.
-    #[clap(short = 'p', long)]
-    register_proxy: bool,
-
-    /// Sender to use when creating the account.
+struct InstallCommand {
+    /// API Endpoint URL (ie https://psibase-api.example.com) or a Host Alias (ie prod, dev). See `psibase config --help` for more details.
     #[clap(
-        short = 'S',
+        short = 'a',
         long,
-        value_name = "SENDER",
-        default_value = "account-sys"
+        value_name = "URL_OR_HOST_ALIAS",
+        env = "PSINODE_URL"
     )]
-    sender: ExactAccountNumber,
+    api: Option<String>,
+
+    /// Sender to use for installing. The packages and all accounts
+    /// that they create will be owned by this account.
+    #[clap(short = 'S', long, value_name = "SENDER")]
+    sender: Option<ExactAccountNumber>,
+
+    /// Configure compression level for package file uploads
+    /// (1=fastest, 11=most compression)
+    #[clap(short = 'z', long, value_name = "LEVEL")]
+    compression_level: Option<u32>,
+
+    /// Reinstall the package
+    #[clap(short = 'r', long)]
+    reinstall: bool,
+}
+
+#[derive(Parser, Debug)]
+struct TestCommand {
+    /// Matches any test containing this string
+    #[clap(value_name = "TEST_NAME")]
+    test_filter: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -96,55 +119,128 @@ enum Command {
     /// Build a service
     Build {},
 
-    /// Build and run tests
-    Test {},
+    /// Build a psibase package
+    Package {},
 
-    /// Build and deploy a service
-    Deploy(DeployCommand),
+    /// Build and run tests
+    Test(TestCommand),
+
+    /// Build and install a psibase package
+    Install(InstallCommand),
 }
 
 fn pretty(label: &str, message: &str) {
     println!("{:>12} {}", style(label).bold().green(), message);
 }
 
+fn warn(label: &str, message: &str) {
+    println!(
+        "{}: {} {}",
+        style("warning").bold().yellow(),
+        style(label).bold().yellow(),
+        message
+    );
+}
+
 fn pretty_path(label: &str, filename: &Path) {
     pretty(label, &filename.file_name().unwrap().to_string_lossy());
 }
 
-fn optimize(filename: &Path, code: &[u8]) -> Result<Vec<u8>, Error> {
-    pretty_path("Reoptimizing", filename);
-    let mut module = Module::read(code)
-        .map_err(|_| anyhow!("Binaryen failed to parse {}", filename.to_string_lossy()))?;
-    module.optimize(&CodegenConfig {
-        shrink_level: 1,
-        optimization_level: 2,
-        debug_info: false,
-    });
-    Ok(module.write())
+fn find_psibase() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = exe.canonicalize() {
+            if let Some(parent) = exe.parent() {
+                let psibase = format!("psibase{}", std::env::consts::EXE_SUFFIX);
+                let sibling = parent.join(&psibase);
+                if sibling.is_file() {
+                    return sibling;
+                }
+            }
+        }
+    }
+    "psibase".to_string().into()
 }
 
-fn process(filename: &PathBuf, polyfill: &[u8]) -> Result<(), Error> {
-    let timestamp_file = filename.to_string_lossy().to_string() + ".cargo_psibase";
+fn find_psitest() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = exe.canonicalize() {
+            if let Some(parent) = exe.parent() {
+                let psitest = format!("psitest{}", std::env::consts::EXE_SUFFIX);
+                let sibling = parent.join(&psitest);
+                if sibling.is_file() {
+                    return sibling;
+                }
+                if parent.ends_with("rust/release") {
+                    let in_build_dir = parent.parent().unwrap().parent().unwrap().join(psitest);
+                    if in_build_dir.exists() {
+                        return in_build_dir;
+                    }
+                }
+            }
+        }
+    }
+    "psitest".to_string().into()
+}
+
+fn optimize(code: &mut Module) -> Result<(), Error> {
+    let file = tempfile::NamedTempFile::new()?;
+    code.emit_wasm_file(file.path())?;
+
+    let debug_build = false;
+    OptimizationOptions::new_opt_level_2()
+        .shrink_level(wasm_opt::ShrinkLevel::Level1)
+        .enable_feature(wasm_opt::Feature::BulkMemory)
+        .enable_feature(wasm_opt::Feature::TruncSat)
+        .enable_feature(wasm_opt::Feature::SignExt)
+        .enable_feature(wasm_opt::Feature::Simd)
+        .debug_info(debug_build)
+        .run(file.path(), file.path())?;
+
+    let mut config = walrus::ModuleConfig::new();
+    config.generate_name_section(false);
+    config.generate_producers_section(false);
+    *code = config.parse_file(file.path().to_path_buf())?;
+
+    Ok(())
+}
+
+fn process(filename: &PathBuf, polyfill: Option<&[u8]>) -> Result<(), Error> {
+    let mut timestamp_file = filename.clone();
+    timestamp_file.as_mut_os_string().push(".cargo_psibase");
     let md = fs::metadata(filename)
-        .with_context(|| format!("Failed to get metadata for {}", filename.to_string_lossy()))?;
-    if let Ok(md2) = fs::metadata::<PathBuf>(timestamp_file.as_str().into()) {
+        .with_context(|| format!("Failed to get metadata for {}", filename.display()))?;
+    if let Ok(md2) = fs::metadata(&timestamp_file) {
         if md2.modified().unwrap() >= md.modified().unwrap() {
             return Ok(());
         }
     }
 
-    let code = &read(filename)
-        .with_context(|| format!("Failed to read {}", filename.to_string_lossy()))?;
-    pretty_path("Polyfilling", filename);
-    let code = link::link(filename, code, polyfill)?;
-    let code = optimize(filename, &code)?;
-    write(filename, code)
-        .with_context(|| format!("Failed to write {}", filename.to_string_lossy()))?;
+    let code = &read(filename).with_context(|| format!("Failed to read {}", filename.display()))?;
+
+    let debug_build = false;
+    let mut config = walrus::ModuleConfig::new();
+    config.generate_name_section(debug_build);
+    config.generate_producers_section(false);
+    let mut dest_module = config.parse(code)?;
+
+    if let Some(polyfill) = polyfill {
+        let polyfill_source_module = config.parse(polyfill)?;
+        pretty_path("Polyfilling", filename);
+        link_module(&polyfill_source_module, &mut dest_module)?;
+    }
+
+    pretty_path("Reoptimizing", filename);
+    optimize(&mut dest_module)?;
+
+    write(filename, dest_module.emit_wasm())
+        .with_context(|| format!("Failed to write {}", filename.display()))?;
+
     OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
         .open(timestamp_file)?;
+
     Ok(())
 }
 
@@ -188,10 +284,27 @@ fn get_cargo() -> OsString {
     env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
-fn get_metadata() -> Result<Metadata, Error> {
+fn get_manifest_path(args: &Args) -> Vec<&OsStr> {
+    if let Some(mpath) = &args.manifest_path {
+        vec![OsStr::new("--manifest-path"), mpath.as_os_str()]
+    } else {
+        vec![]
+    }
+}
+
+fn get_target_dir(args: &Args) -> Vec<&OsStr> {
+    if let Some(tdir) = &args.target_dir {
+        vec![OsStr::new("--target-dir"), tdir.as_os_str()]
+    } else {
+        vec![]
+    }
+}
+
+fn get_metadata(args: &Args) -> Result<Metadata, Error> {
     let output = std::process::Command::new(get_cargo())
         .arg("metadata")
         .arg("--format-version=1")
+        .args(get_manifest_path(args))
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .output()?;
@@ -201,20 +314,44 @@ fn get_metadata() -> Result<Metadata, Error> {
     Ok(serde_json::from_slice::<Metadata>(&output.stdout)?)
 }
 
+/// Check the psibase dependency version against cargo-psibase
+fn check_psibase_version(metadata: &Metadata) {
+    let psibase_version = &metadata
+        .packages
+        .iter()
+        .find(|pkg| pkg.name == "psibase")
+        .expect("psibase dependency not found")
+        .version;
+
+    let cargo_psibase_version = Version::parse(CARGO_PSIBASE_VERSION).unwrap();
+
+    if *psibase_version != cargo_psibase_version {
+        let version_mismatch_msg = format!(
+            "The version of `cargo-psibase` used (v{}) and the version of `psibase` on which your service depends (v{}) should match",
+            CARGO_PSIBASE_VERSION, psibase_version
+        );
+        warn("Version Mismatch", &version_mismatch_msg);
+    }
+}
+
 async fn build(
+    args: &Args,
     packages: &[&str],
     envs: Vec<(&str, &str)>,
-    args: &[&str],
-    poly: &[u8],
+    extra_args: &[&str],
+    poly: Option<&[u8]>,
 ) -> Result<Vec<PathBuf>, Error> {
     let mut command = tokio::process::Command::new(get_cargo())
         .envs(envs)
         .arg("rustc")
-        .args(args)
+        .args(extra_args)
         .arg("--release")
-        .arg("--target=wasm32-wasi")
+        .arg("--target=wasm32-wasip1")
+        .args(get_manifest_path(args))
+        .args(get_target_dir(args))
         .arg("--message-format=json-diagnostic-rendered-ansi")
         .arg("--color=always")
+        .args(SERVICE_ARGS_RUSTC)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -238,174 +375,392 @@ async fn build(
     Ok(files)
 }
 
-async fn get_test_services() -> Result<Vec<(String, String)>, Error> {
+async fn build_schema(
+    args: &Args,
+    packages: &[&str],
+    extra_args: &[&str],
+) -> Result<Schema, Error> {
     let mut command = tokio::process::Command::new(get_cargo())
+        .envs(vec![("CARGO_PSIBASE_TEST", "")])
         .arg("test")
+        .args(extra_args)
+        .arg("--release")
+        .arg("--target=wasm32-wasip1")
+        .args(get_manifest_path(args))
+        .args(get_target_dir(args))
+        .arg("--message-format=json-diagnostic-rendered-ansi")
         .arg("--color=always")
-        .arg("--")
-        .arg("--show-output")
-        .arg("_psibase_test_get_needed_services")
+        .arg("--lib")
+        .arg("--no-run")
+        .args(SERVICE_ARGS_RUSTC)
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
 
-    let mut stdout = tokio::io::BufReader::new(command.stdout.take().unwrap()).lines();
+    let stdout = tokio::io::BufReader::new(command.stdout.take().unwrap()).lines();
+    let stderr = tokio::io::BufReader::new(command.stderr.take().unwrap()).lines();
     let status = command.wait();
-
-    let (status, lines) = tokio::join!(
-        status, //
-        async {
-            let mut lines = Vec::new();
-            while let Some(line) = stdout.next_line().await? {
-                lines.push(line);
-            }
-            Ok::<_, Error>(lines)
-        },
-    );
+    let (status, files, _) =
+        tokio::join!(status, get_files(packages, stdout), print_messages(stderr),);
 
     let status = status?;
     if !status.success() {
         exit(status.code().unwrap());
     }
 
-    let re = Regex::new(r"^psibase-test-need-service +([^ ]+) +([^ ]+)$").unwrap();
-    Ok(lines?
-        .iter()
-        .filter_map(|line| re.captures(line))
-        .map(|cap| (cap[1].to_owned(), cap[2].to_owned()))
-        .collect())
+    let files = files?;
+    for f in &files {
+        process(f, None)?
+    }
+
+    let mut command = tokio::process::Command::new(&args.psitest)
+        .arg(&files[0])
+        .arg("_psibase_get_schema")
+        .arg("--show-output")
+        .arg("--include-ignored")
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let mut stdout = tokio::io::BufReader::new(command.stdout.take().unwrap()).lines();
+    let status = command.wait();
+
+    let (status, schema) = tokio::join!(
+        status, //
+        async {
+            let re = Regex::new(r"^psibase-schema-gen-output: (.*)$").unwrap();
+            let mut schema = None;
+            while let Some(line) = stdout.next_line().await? {
+                if schema.is_none() {
+                    if let Some(cap) = re.captures(&line) {
+                        schema = Some(cap[1].to_owned());
+                    }
+                }
+            }
+            Ok::<_, Error>(schema)
+        },
+    );
+    let status = status?;
+    if !status.success() {
+        exit(status.code().unwrap());
+    }
+
+    Ok(serde_json::from_str::<Schema>(
+        &schema?.ok_or_else(|| anyhow!("Failed to generate schema"))?,
+    )?)
 }
 
-async fn test(metadata: &Metadata, root: &str) -> Result<(), Error> {
-    let mut services = get_test_services().await?;
-    services.sort();
-    services.dedup();
+async fn build_plugin(
+    args: &Args,
+    packages: &[&str],
+    extra_args: &[&str],
+) -> Result<Vec<PathBuf>, Error> {
+    let mut command = tokio::process::Command::new(get_cargo())
+        .arg("component")
+        .arg("build")
+        .args(extra_args)
+        .arg("--release")
+        .arg("--target=wasm32-wasip1")
+        .args(get_manifest_path(args))
+        .args(get_target_dir(args))
+        .arg("--message-format=json-render-diagnostics")
+        .arg("--color=always")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-    pretty(
-        "Services",
-        &services
-            .iter()
-            .map(|(s, _)| s.to_owned())
-            .reduce(|acc, item| acc + ", " + &item)
-            .unwrap_or_default(),
-    );
+    let stdout = tokio::io::BufReader::new(command.stdout.take().unwrap()).lines();
+    let stderr = tokio::io::BufReader::new(command.stderr.take().unwrap()).lines();
+    let status = command.wait();
+    let (status, files, _) =
+        tokio::join!(status, get_files(packages, stdout), print_messages(stderr),);
 
-    let mut service_wasms = String::new();
-    for (service, src) in services {
-        pretty("Service", &format!("{} needed by {}", service, src));
-        let mut id = None;
-        for package in &metadata.packages {
-            if package.name == service {
-                // TODO: detect multiple versions
-                id = Some(&package.id.repr);
+    let status = status?;
+    if !status.success() {
+        exit(status.code().unwrap());
+    }
+
+    Ok(files?)
+}
+
+async fn build_package_root(args: &Args, package: &str) -> Result<(), Error> {
+    let mut command = tokio::process::Command::new(get_cargo())
+        .arg("rustc")
+        .args(&["-p", package])
+        .arg("--release")
+        .arg("--lib")
+        .arg("--target=wasm32-wasip1")
+        .args(get_manifest_path(args))
+        .args(get_target_dir(args))
+        .arg("--color=always")
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+
+    let status = command.wait().await?;
+
+    if !status.success() {
+        exit(status.code().unwrap());
+    }
+
+    Ok(())
+}
+
+fn is_wasm32_wasi(dep: &DepKindInfo) -> bool {
+    if let Some(platform) = &dep.target {
+        if platform.matches("wasm32-wasip1", &[]) {
+            true
+        } else {
+            false
+        }
+    } else {
+        true
+    }
+}
+
+fn is_test_dependency(dep: &NodeDep) -> bool {
+    for kind in &dep.dep_kinds {
+        if matches!(
+            kind.kind,
+            DependencyKind::Normal | DependencyKind::Development
+        ) && is_wasm32_wasi(kind)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_normal_dependency(dep: &NodeDep) -> bool {
+    for kind in &dep.dep_kinds {
+        if matches!(kind.kind, DependencyKind::Normal) && is_wasm32_wasi(kind) {
+            return true;
+        }
+    }
+    false
+}
+
+struct PackageSet<'a> {
+    packages: Vec<&'a PackageId>,
+    visited: HashSet<&'a PackageId>,
+    metadata: &'a MetadataIndex<'a>,
+}
+
+impl<'a> PackageSet<'a> {
+    fn new(metadata: &'a MetadataIndex) -> Self {
+        PackageSet {
+            packages: Vec::new(),
+            visited: HashSet::new(),
+            metadata,
+        }
+    }
+    fn try_insert(&mut self, id: &'a PackageId) -> Result<bool, anyhow::Error> {
+        if package::get_metadata(self.metadata.packages.get(id.repr.as_str()).unwrap())?
+            .is_package()
+        {
+            if self.visited.insert(id) {
+                self.packages.push(id);
+                return Ok(true);
             }
         }
-        if id.is_none() {
-            return Err(anyhow!(
-                "can not find package {service}; try: cargo add {service}"
-            ));
+        Ok(false)
+    }
+    fn resolve_dependencies(&mut self) -> Result<(), anyhow::Error> {
+        for i in 0.. {
+            if i == self.packages.len() {
+                break;
+            }
+            let id = &self.packages[i];
+            let node = self.metadata.resolved.get(&id.repr.as_str()).unwrap();
+            for dep in &node.deps {
+                if is_normal_dependency(dep) {
+                    self.try_insert(&dep.pkg)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn build(&self, args: &Args) -> Result<Vec<PackageInfo>, Error> {
+        pretty(
+            "Packages",
+            &self
+                .packages
+                .iter()
+                .map(|item| {
+                    self.metadata
+                        .packages
+                        .get(&item.repr.as_str())
+                        .unwrap()
+                        .name
+                        .to_string()
+                })
+                .reduce(|acc, item| acc + ", " + &item)
+                .unwrap_or_default(),
+        );
+
+        let mut index = Vec::new();
+
+        for p in &self.packages {
+            index.push(build_package(args, self.metadata, Some(&p.repr)).await?);
+        }
+        Ok(index)
+    }
+}
+
+fn get_test_packages<'a>(
+    metadata: &'a MetadataIndex,
+    root: &str,
+) -> Result<PackageSet<'a>, anyhow::Error> {
+    let node = metadata.resolved.get(root).unwrap();
+    let mut packages = PackageSet::new(metadata);
+    let root = &metadata.packages.get(root).unwrap().id;
+    packages.try_insert(root)?;
+    // get packages that are dependencies and dev-dependencies of the root package
+    for dep in &node.deps {
+        if is_test_dependency(dep) {
+            packages.try_insert(&dep.pkg)?;
+        }
+    }
+    packages.resolve_dependencies()?;
+    Ok(packages)
+}
+
+async fn test(args: &Args, opts: &TestCommand, metadata: &MetadataIndex<'_>) -> Result<(), Error> {
+    let mut test_packages: Vec<(&str, PackageSet)> = Vec::new();
+    if args.package.is_empty() {
+        for id in &*metadata.metadata.workspace_default_members {
+            test_packages.push((id.repr.as_str(), get_test_packages(metadata, &id.repr)?));
+        }
+    } else {
+        for package in &args.package {
+            let id = &metadata
+                .metadata
+                .packages
+                .iter()
+                .find(|p| &p.name == package)
+                .ok_or_else(|| anyhow!("Could not find package {}", package))?
+                .id;
+            test_packages.push((id.repr.as_str(), get_test_packages(metadata, &id.repr)?));
+        }
+    }
+
+    let target_dir = args.target_dir.as_ref().map_or_else(
+        || metadata.metadata.target_directory.as_std_path(),
+        |p| p.as_path(),
+    );
+    let out_dir = target_dir.join("wasm32-wasip1/release/packages");
+    let mut built: HashMap<&PackageId, PackageInfo> = HashMap::new();
+    let mut test_info = Vec::new();
+    pretty("Packages", "building dependencies...");
+    for (id, deps) in test_packages {
+        let mut index = Vec::new();
+        for p in &deps.packages {
+            if let Some(found) = built.get(p) {
+                index.push(found.clone());
+            } else {
+                let info = build_package(args, metadata, Some(p.repr.as_str())).await?;
+                built.insert(p, info.clone());
+                index.push(info);
+            }
         }
 
-        let wasms = build(
-            &[id.unwrap()],
-            vec![],
-            &["--lib", "--crate-type=cdylib", "-p", &service],
-            SERVICE_POLYFILL,
+        // Write a package index specific to the crate
+        let index_file =
+            out_dir.join(metadata.packages.get(id).unwrap().name.clone() + "-index.json");
+        serde_json::to_writer(File::create(&index_file)?, &index)?;
+        test_info.push((id, index_file));
+    }
+
+    for (id, index_file) in test_info {
+        pretty("Test", "building unit tests...");
+        let name = &metadata.packages.get(id).unwrap().name;
+        let tests = build(
+            args,
+            &[id],
+            vec![
+                ("CARGO_PSIBASE_TEST", ""),
+                (
+                    "CARGO_PSIBASE_PACKAGE_PATH",
+                    index_file.canonicalize()?.to_str().unwrap(),
+                ),
+            ],
+            &["--tests", "-p", name.as_str()],
+            None,
         )
         .await?;
-        if wasms.is_empty() {
-            return Err(anyhow!("Service {} produced no wasm targets", service));
-        }
-        if wasms.len() > 1 {
-            return Err(anyhow!(
-                "Service {} produced multiple wasm targets",
-                service
-            ));
-        }
-        if !service_wasms.is_empty() {
-            service_wasms += ";";
-        }
-        service_wasms += &(service + ";" + &wasms.into_iter().next().unwrap().to_string_lossy());
-    }
 
-    // println!("CARGO_PSIBASE_SERVICE_LOCATIONS={:?}", service_wasms);
-    let tests = build(
-        &[root],
-        vec![
-            ("CARGO_PSIBASE_TEST", ""),
-            ("CARGO_PSIBASE_SERVICE_LOCATIONS", &service_wasms),
-        ],
-        &["--tests"],
-        TESTER_POLYFILL,
-    )
-    .await?;
-    if tests.is_empty() {
-        return Err(anyhow!("No tests found"));
-    }
-
-    for test in tests {
-        pretty_path("Running", &test);
-        let args = [test.to_str().unwrap(), "--nocapture"];
-        let msg = format!("Failed running: psitest {}", args.join(" "));
-        if !std::process::Command::new("psitest")
-            .args(args)
-            .status()
-            .context(msg.clone())?
-            .success()
-        {
-            return Err(anyhow! {msg});
+        for test in tests {
+            pretty_path("Running", &test);
+            let mut command = std::process::Command::new(&args.psitest);
+            command.arg(test);
+            command.arg("--nocapture");
+            if let Some(ref filter) = opts.test_filter {
+                command.arg(filter);
+            }
+            let msg = format!("Failed running: {:?}", command);
+            if !command.status().context(msg.clone())?.success() {
+                return Err(anyhow! {msg});
+            }
         }
     }
 
     Ok(())
 }
 
-async fn deploy(opts: &DeployCommand, root: &str) -> Result<(), Error> {
-    let files = build(&[root], vec![], SERVICE_ARGS, SERVICE_POLYFILL).await?;
-    if files.is_empty() {
-        Err(anyhow!("Nothing found to deploy"))?
-    }
-    if files.len() > 1 {
-        Err(anyhow!("Expected a single library"))?
-    }
-
-    let account = if let Some(account) = opts.account {
-        account.to_string()
+async fn install(
+    args: &Args,
+    opts: &InstallCommand,
+    metadata: &MetadataIndex<'_>,
+) -> Result<(), Error> {
+    let mut packages = PackageSet::new(metadata);
+    if args.package.is_empty() {
+        for id in &*metadata.metadata.workspace_default_members {
+            packages.try_insert(id)?;
+        }
     } else {
-        files[0]
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .replace('_', "-")
-            .replace(".wasm", "")
-    };
+        for package in &args.package {
+            let id = &metadata
+                .metadata
+                .packages
+                .iter()
+                .find(|p| &p.name == package)
+                .ok_or_else(|| anyhow!("Could not find package {}", package))?
+                .id;
+            if !packages.try_insert(id)? {
+                Err(anyhow!("{} is not a psibase package", package))?
+            }
+        }
+    }
+    packages.resolve_dependencies()?;
+    let index = packages.build(args).await?;
 
-    let mut args = vec!["--suppress-ok".into(), "deploy".into()];
-    if let Some(key) = &opts.create_account {
-        args.append(&mut vec!["--create-account".into(), key.to_string()]);
-    }
-    if opts.create_insecure_account {
-        args.push("--create-insecure-account".into());
-    }
-    if opts.register_proxy {
-        args.push("--register-proxy".into());
-    }
-    args.append(&mut vec!["--sender".into(), opts.sender.to_string()]);
-    args.push(account.clone());
-    args.push(files[0].to_string_lossy().into());
+    let mut command = std::process::Command::new(&args.psibase);
 
-    let msg = format!("Failed running: psibase {}", args.join(" "));
-    if !std::process::Command::new("psibase")
-        .args(args)
-        .status()
-        .context(msg.clone())?
-        .success()
-    {
+    command.arg("install");
+    if let Some(api) = &opts.api {
+        command.args(["--api", api.as_str()]);
+    }
+    if let Some(sender) = &opts.sender {
+        command.args(["--sender", &sender.to_string()]);
+    }
+
+    if opts.reinstall {
+        command.args(["--reinstall"]);
+    }
+
+    if let Some(compression_level) = opts.compression_level {
+        command.args(["--compression-level", &compression_level.to_string()]);
+    }
+
+    // Get package files
+    let out_dir = get_package_dir(args, metadata);
+    for info in index {
+        command.arg(out_dir.join(&info.file));
+    }
+
+    let msg = format!("Failed running: {:?}", command);
+    if !command.status().context(msg.clone())?.success() {
         Err(anyhow! {msg})?;
     }
-
-    pretty("Deployed", &account);
-
     Ok(())
 }
 
@@ -423,35 +778,89 @@ async fn main2() -> Result<(), Error> {
         Args::parse()
     };
 
-    let metadata = get_metadata()?;
-    let root = &metadata
-        .resolve
-        .as_ref()
-        .unwrap()
-        .root
-        .as_ref()
-        .unwrap()
-        .repr;
+    let metadata = get_metadata(&args)?;
+    check_psibase_version(&metadata);
 
-    match args.command {
+    match &args.command {
         Command::Build {} => {
-            build(&[root], vec![], SERVICE_ARGS, SERVICE_POLYFILL).await?;
+            if args.package.is_empty() {
+                let index = MetadataIndex::new(&metadata);
+                for id in &*metadata.workspace_default_members {
+                    let package = &index.packages.get(id.repr.as_str()).unwrap().name;
+                    let mut extra_args = SERVICE_ARGS.to_owned();
+                    extra_args.extend(["-p", package.as_str()]);
+                    build(
+                        &args,
+                        &[id.repr.as_str()],
+                        vec![],
+                        &extra_args,
+                        Some(SERVICE_POLYFILL),
+                    )
+                    .await?;
+                }
+            } else {
+                for package in &args.package {
+                    let id = &metadata
+                        .packages
+                        .iter()
+                        .find(|p| &p.name == package)
+                        .ok_or_else(|| anyhow!("Could not find package {}", package))?
+                        .id
+                        .repr;
+                    let mut extra_args = SERVICE_ARGS.to_owned();
+                    extra_args.extend(["-p", package.as_str()]);
+                    build(
+                        &args,
+                        &[id.as_str()],
+                        vec![],
+                        &extra_args,
+                        Some(SERVICE_POLYFILL),
+                    )
+                    .await?;
+                }
+            }
             pretty("Done", "");
         }
-        Command::Test {} => {
-            test(&metadata, root).await?;
+        Command::Package {} => {
+            let index = MetadataIndex::new(&metadata);
+            if args.package.is_empty() {
+                for id in &*metadata.workspace_default_members {
+                    let package = index.packages.get(id.repr.as_str()).unwrap();
+                    if package::get_metadata(package)?.is_package() {
+                        build_package(&args, &index, Some(id.repr.as_str())).await?;
+                    }
+                }
+            } else {
+                for package in &args.package {
+                    let id = &metadata
+                        .packages
+                        .iter()
+                        .find(|p| &p.name == package)
+                        .ok_or_else(|| anyhow!("Could not find package {}", package))?
+                        .id
+                        .repr;
+                    build_package(&args, &index, Some(id)).await?;
+                }
+            }
+            pretty("Done", "");
+        }
+        Command::Test(opts) => {
+            test(&args, opts, &MetadataIndex::new(&metadata)).await?;
             pretty("Done", "All tests passed");
         }
-        Command::Deploy(args) => {
-            deploy(&args, root).await?;
+        Command::Install(opts) => {
+            install(&args, opts, &MetadataIndex::new(&metadata)).await?;
         }
     };
 
     Ok(())
 }
 
-fn main() {
+fn main() -> ExitCode {
     if let Err(e) = main2() {
         println!("{:}: {:?}", style("error").bold().red(), e);
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }

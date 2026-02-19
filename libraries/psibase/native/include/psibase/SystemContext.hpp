@@ -5,11 +5,16 @@
 
 namespace psibase
 {
+   struct WatchdogManager;
+   struct Sockets;
+
    struct SystemContext
    {
-      SharedDatabase               sharedDatabase;
-      WasmCache                    wasmCache;
-      std::vector<ExecutionMemory> executionMemories;
+      SharedDatabase                   sharedDatabase;
+      WasmCache                        wasmCache;
+      std::vector<ExecutionMemory>     executionMemories;
+      std::shared_ptr<WatchdogManager> watchdogManager;
+      std::shared_ptr<Sockets>         sockets;
 
       void setNumMemories(size_t n)
       {
@@ -28,6 +33,14 @@ namespace psibase
 
       SharedState(SharedDatabase db, psibase::WasmCache wasmCache);
       ~SharedState();
+
+      std::vector<std::span<const char>> dbSpan() const;
+      std::vector<std::span<const char>> codeSpan() const;
+      std::vector<std::span<const char>> linearMemorySpan() const;
+
+      bool needGenesis() const;
+
+      std::shared_ptr<Sockets> sockets();
 
       std::unique_ptr<SystemContext> getSystemContext();
       void                           addSystemContext(std::unique_ptr<SystemContext> context);

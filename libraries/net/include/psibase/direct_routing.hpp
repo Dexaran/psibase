@@ -10,55 +10,40 @@
 #include <psibase/SignedMessage.hpp>
 #include <psibase/log.hpp>
 #include <psibase/net_base.hpp>
+#include <psibase/routing_base.hpp>
 #include <psio/fracpack.hpp>
 #include <queue>
+#include <random>
 #include <vector>
 
 namespace psibase::net
 {
-#ifndef PSIO_REFLECT_INLINE
-#define PSIO_REFLECT_INLINE(name, ...)                      \
-   PSIO_REFLECT(name, __VA_ARGS__)                          \
-   friend reflect_impl_##name get_reflect_impl(const name&) \
-   {                                                        \
-      return {};                                            \
-   }
-#endif
+   struct ProducerMessage
+   {
+      static constexpr unsigned type = 2;
+      producer_id               producer;
+      std::string               to_string() const { return "producer: " + producer.str(); }
+   };
+   PSIO_REFLECT(ProducerMessage, producer)
 
    // This requires all producers to be peers
    template <typename Derived>
-   struct direct_routing
+   struct direct_routing : routing_base<Derived>
    {
-      auto& peers() { return static_cast<Derived*>(this)->peers(); }
-      auto& chain() { return static_cast<Derived*>(this)->chain(); }
-      explicit direct_routing(boost::asio::io_context& ctx) {}
-      static const std::uint32_t protocol_version = 0;
-      struct init_message
-      {
-         static constexpr unsigned type    = 1;
-         std::uint32_t             version = protocol_version;
-         std::string to_string() const { return "init: version=" + std::to_string(version); }
-         PSIO_REFLECT_INLINE(init_message, version);
-      };
-      struct producer_message
-      {
-         static constexpr unsigned type = 2;
-         producer_id               producer;
-         std::string               to_string() const { return "producer: " + producer.str(); }
-         PSIO_REFLECT_INLINE(producer_message, producer)
-      };
-      auto get_message_impl()
-      {
-         return boost::mp11::mp_push_back<
-             typename std::remove_cvref_t<
-                 decltype(static_cast<Derived*>(this)->consensus())>::message_type,
-             init_message, producer_message>{};
-      }
+      using base_type = routing_base<Derived>;
+      using base_type::async_send;
+      using base_type::base_type;
+      using base_type::chain;
+      using base_type::consensus;
+      using base_type::peers;
+      using base_type::recv;
+
+      using message_type = std::variant<ProducerMessage>;
+
       template <typename Msg, typename F>
       void async_send_block(peer_id id, const Msg& msg, F&& f)
       {
-         PSIBASE_LOG(peers().logger(id), debug) << "Sending message: " << msg.to_string();
-         peers().async_send(id, serialize_message(msg), std::forward<F>(f));
+         async_send(id, msg, f);
       }
       // Sends a message to each peer in a list
       // each peer will receive the message only once even if it is duplicated in the input list.
@@ -67,7 +52,7 @@ namespace psibase::net
       {
          std::sort(dest.begin(), dest.end());
          dest.erase(std::unique(dest.begin(), dest.end()), dest.end());
-         auto serialized_message = serialize_message(msg);
+         auto serialized_message = this->serialize_message(msg);
          for (auto peer : dest)
          {
             PSIBASE_LOG(peers().logger(peer), debug) << "Sending message: " << msg.to_string();
@@ -85,6 +70,12 @@ namespace psibase::net
          async_multicast(std::move(producer_peers), msg);
       }
       template <typename Msg>
+      void multicast(const Msg& msg)
+      {
+         // TODO: send to non-producers as well
+         multicast_producers(msg);
+      }
+      template <typename Msg>
       void sendto(producer_id prod, const Msg& msg)
       {
          std::vector<peer_id> peers_for_producer;
@@ -94,20 +85,21 @@ namespace psibase::net
          }
          async_multicast(std::move(peers_for_producer), msg);
       }
+      bool is_reachable(producer_id prod) const { return producers.find(prod) != producers.end(); }
       struct connection;
       void connect(peer_id id)
       {
-         async_send_block(id, init_message{}, [](const std::error_code&) {});
+         base_type::connect(id);
          if (auto producer = static_cast<Derived*>(this)->consensus().producer_name();
              producer != AccountNumber())
          {
-            async_send_block(id, producer_message{producer}, [](const std::error_code&) {});
+            async_send_block(id, ProducerMessage{producer}, [](const std::error_code&) {});
          }
-         static_cast<Derived*>(this)->consensus().connect(id);
+         consensus().connect(id);
       }
       void disconnect(peer_id id)
       {
-         static_cast<Derived*>(this)->consensus().disconnect(id);
+         consensus().disconnect(id);
          for (auto iter = producers.begin(), end = producers.end(); iter != end;)
          {
             if (iter->second == id)
@@ -120,105 +112,10 @@ namespace psibase::net
             }
          }
       }
-      template <template <typename...> class L, typename... T>
-      static constexpr bool check_message_uniqueness(L<T...>*)
-      {
-         std::uint8_t ids[] = {T::type...};
-         for (std::size_t i = 0; i < sizeof(ids) - 1; ++i)
-         {
-            for (std::size_t j = i + 1; j < sizeof(ids); ++j)
-            {
-               if (ids[i] == ids[j])
-               {
-                  return false;
-               }
-            }
-         }
-         return true;
-      }
-      template <typename Msg>
-      static std::vector<char> serialize_unsigned_message(const Msg& msg)
-      {
-         static_assert(Msg::type < 128);
-         std::vector<char> result(psio::fracpack_size(msg) + 1);
-         result[0] = Msg::type;
-         psio::fast_buf_stream s(result.data() + 1, result.size() - 1);
-         psio::fracpack(msg, s);
-         return result;
-      }
-      template <typename Msg>
-      std::vector<char> serialize_signed_message(const Msg& msg)
-      {
-         // TODO: avoid serializing the message twice
-         auto  raw   = serialize_unsigned_message(msg);
-         Claim claim = msg.signer();
-         auto  sig   = chain().sign({raw.data(), raw.size()}, claim);
-         return serialize_unsigned_message(SignedMessage<Msg>{msg, sig});
-      }
-      template <typename Msg>
-      auto serialize_message(const Msg& msg)
-      {
-         return serialize_unsigned_message(msg);
-      }
-      template <NeedsSignature Msg>
-      auto serialize_message(const Msg& msg)
-      {
-         return serialize_signed_message(msg);
-      }
-      template <typename T>
-      void try_recv_impl(peer_id peer, psio::input_stream& s)
-      {
-         try
-         {
-            return recv(
-                peer,
-                psio::convert_from_frac<std::conditional_t<NeedsSignature<T>, SignedMessage<T>, T>>(
-                    s));
-         }
-         catch (std::exception& e)
-         {
-            PSIBASE_LOG(peers().logger(peer), warning) << e.what();
-            peers().disconnect(peer);
-         }
-      }
-      template <template <typename...> class L, typename... T>
-      void recv_impl(peer_id peer, int key, const std::vector<char>& msg, L<T...>*)
-      {
-         psio::input_stream s(msg.data() + 1, msg.size() - 1);
-         ((key == T::type ? try_recv_impl<T>(peer, s) : (void)0), ...);
-      }
-      void recv(peer_id peer, const std::vector<char>& msg)
-      {
-         using message_type = decltype(get_message_impl());
-         static_assert(check_message_uniqueness((message_type*)nullptr));
-         recv_impl(peer, msg[0], msg, (message_type*)0);
-      }
-      void recv(peer_id peer, const init_message& msg)
-      {
-         PSIBASE_LOG(peers().logger(peer), debug) << "Received message: " << msg.to_string();
-         if (msg.version != protocol_version)
-         {
-            peers().disconnect(peer);
-         }
-      }
-      void recv(peer_id peer, const producer_message& msg)
+      void recv(peer_id peer, const ProducerMessage& msg)
       {
          PSIBASE_LOG(peers().logger(peer), debug) << "Received message: " << msg.to_string();
          producers.insert({msg.producer, peer});
-      }
-      template <typename T>
-      void recv(peer_id peer, const SignedMessage<T>& msg)
-      {
-         auto  raw   = serialize_unsigned_message(msg.data);
-         Claim claim = msg.data.signer();
-         PSIBASE_LOG(peers().logger(peer), debug) << "Received message: " << msg.data.to_string();
-         chain().verify({raw.data(), raw.size()}, claim, msg.signature);
-         static_cast<Derived*>(this)->consensus().recv(peer, msg.data);
-      }
-      void recv(peer_id peer, const auto& msg)
-      {
-         PSIBASE_LOG(peers().logger(peer), debug) << "Received message: " << msg.to_string();
-         static_cast<Derived*>(this)->consensus().recv(peer, msg);
       }
       std::multimap<producer_id, peer_id> producers;
    };

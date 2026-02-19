@@ -2,9 +2,13 @@
 #include <atomic>
 #include <iomanip>
 #include <iostream>
+#include <thread>
+//#include <syncstream>
 
 namespace triedent
 {
+   static constexpr bool debug_cache = false;
+   static constexpr bool debug_gc    = false;
 
    struct scope
    {
@@ -35,6 +39,15 @@ namespace triedent
          std::cerr << " ";
       ((std::cerr << std::forward<Ts>(args)), ...);
       std::cerr << "\n";
+   }
+
+   inline auto set_current_thread_name(const char* name)
+   {
+#ifdef __APPLE__
+      return pthread_setname_np(name);
+#else
+      return pthread_setname_np(pthread_self(), name);
+#endif
    }
 
 #if 1  //__DEBUG__

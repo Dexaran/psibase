@@ -1,4 +1,4 @@
-find_package(Boost 1.75 REQUIRED COMPONENTS filesystem)
+find_package(Boost 1.75 CONFIG REQUIRED COMPONENTS filesystem)
 
 add_executable(psitest main.cpp)
 
@@ -18,12 +18,18 @@ elseif(UNIX)
     )
 endif()
 
-set_target_properties(psitest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ROOT_BINARY_DIR})
-add_custom_command(TARGET psitest POST_BUILD
-    COMMAND mkdir -p ${ROOT_BINARY_DIR}/psidk/bin
-    COMMAND cp -a $<TARGET_FILE:psitest> ${ROOT_BINARY_DIR}/psidk/bin
-)
+target_link_directories(psitest PUBLIC ${ICU_LIBRARY_DIR} )
 
+set_target_properties(psitest PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${ROOT_BINARY_DIR})
+
+install(TARGETS psitest RUNTIME COMPONENT Tester)
+
+configure_file(psitest-gdb.py ${ROOT_BINARY_DIR}/psitest-gdb.py COPYONLY)
+configure_file(psibase.py ${ROOT_BINARY_DIR}/share/psibase/python/psibase.py COPYONLY)
+
+include(GNUInstallDirs)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/psitest-gdb.py DESTINATION ${CMAKE_INSTALL_DATADIR}/gdb/auto-load/${CMAKE_INSTALL_FULL_BINDIR} COMPONENT Tester)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/psibase.py DESTINATION ${CMAKE_INSTALL_DATADIR}/psibase/python COMPONENT Tester)
 # TODO: find out why this is necessary. Without this,
 # psitest, when compiled with gcc, produces
 # "longjmp causes uninitialized stack frame"

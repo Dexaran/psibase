@@ -1,0 +1,63 @@
+{
+    "name": "@psibase/common-lib",
+    "private": true,
+    "version": "0.0.0",
+    "type": "module",
+    "main": "./dist/common-lib.umd.cjs",
+    "module": "./dist/common-lib.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "import": "./dist/common-lib.js",
+            "require": "./dist/common-lib.umd.cjs",
+            "types": "./dist/index.d.ts",
+            "default": "./dist/common-lib.js"
+        },
+        "./rpc": {
+            "import": "./dist/rpc.js",
+            "require": "./dist/rpc.js",
+            "types": "./dist/rpc.d.ts",
+            "default": "./dist/rpc.js"
+        },
+        "./messaging": {
+            "import": "./dist/messaging/index.js",
+            "require": "./dist/messaging/index.js",
+            "types": "./dist/messaging/index.d.ts",
+            "default": "./dist/messaging/index.js"
+        },
+        "./messaging/*": {
+            "import": "./dist/messaging/*.js",
+            "require": "./dist/messaging/*.js",
+            "types": "./dist/messaging/*.d.ts",
+            "default": "./dist/messaging/*.js"
+        },
+        "./prompts": {
+            "import": "./dist/prompts.js",
+            "require": "./dist/prompts.js",
+            "types": "./dist/prompts.d.ts",
+            "default": "./dist/prompts.js"
+        }
+    },
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "dev": "vite",
+        "build": "node ../../../../../if-build-needed.mjs 'tsc -b --noEmit && vite build'",
+        "preview": "vite preview",
+        "format": "prettier --write 'src/**/*.ts'"
+    },
+    "devDependencies": {
+        "@types/elliptic": "^6.4.14",
+        "@types/node": "^22.14.1",
+        "prettier": "^3.2.5",
+        "prettier-plugin-tailwindcss": "^0.5.13",
+        "typescript": "^5.7.3",
+        "vite": "^5.4.1",
+        "vite-plugin-dts": "^4.5.0"
+    },
+    "dependencies": {
+        "elliptic": "^6.5.4",
+        "hash.js": "^1.1.7"
+    }
+}

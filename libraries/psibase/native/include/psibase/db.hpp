@@ -3,25 +3,104 @@
 #include_next <psibase/db.hpp>
 
 #include <psibase/blob.hpp>
-#include <psibase/nativeTables.hpp>
 #include <psio/fracpack.hpp>
 #include <psio/from_bin.hpp>
 #include <psio/to_key.hpp>
+#include <triedent/file_fwd.hpp>
 
-#include <boost/filesystem/path.hpp>
+#include <array>
+#include <filesystem>
 
 namespace triedent
 {
    class write_session;
-}
+   class root;
+   struct database_config;
+}  // namespace triedent
 
 namespace psibase
 {
+   struct Socket;
+   struct SocketAutoCloseSet;
+   struct Sockets;
+   struct SocketChange;
+   using SocketChangeSet = std::vector<SocketChange>;
+
    struct Revision;
    using ConstRevisionPtr = std::shared_ptr<const Revision>;
 
    using Writer    = triedent::write_session;
    using WriterPtr = std::shared_ptr<Writer>;
+
+   using DbPtr = std::shared_ptr<triedent::root>;
+
+   struct DbChangeSet
+   {
+      struct Range
+      {
+         std::vector<unsigned char> lower;
+         std::vector<unsigned char> upper;
+         bool                       write;
+      };
+      std::vector<Range> ranges;
+      void               onRead(std::span<const char> value);
+      void               onGreaterEqual(std::span<const char> key,
+                                        std::size_t           prefixLen,
+                                        bool                  found,
+                                        std::span<const char> result);
+      void               onLessThan(std::span<const char> key,
+                                    std::size_t           prefixLen,
+                                    bool                  found,
+                                    std::span<const char> result);
+      void               onMax(std::span<const char> key, bool found, std::span<const char> result);
+      void               onWrite(std::span<const char> key);
+   };
+
+   using IndependentRevision  = std::array<DbPtr, numIndependentDatabases>;
+   using IndependentChangeSet = std::array<DbChangeSet, numIndependentDatabases>;
+
+   // Certain rows may trigger callbacks when they are written.
+   //
+   struct DatabaseCallbacks
+   {
+      std::function<void()>                      nextTransaction;
+      std::function<void()>                      runQueue;
+      std::function<void(std::span<const char>)> validateHostConfig;
+      std::function<void()>                      hostConfig;
+      std::function<void()>                      shutdown;
+      // This isn't actually part of the db. It's triggered
+      // by a separate host function, but there isn't a better
+      // place to put it.
+      std::function<void(std::span<const char>,
+                         const std::function<void(const std::shared_ptr<Socket>&)>&)>
+          socketOpen;
+
+      static const unsigned nextTransactionFlag = 1;
+      static const unsigned runQueueFlag        = 2;
+      static const unsigned hostConfigFlag      = 4;
+      static const unsigned shutdownFlag        = 8;
+      using Flags                               = unsigned;
+      void run(Flags& flags)
+      {
+         if ((flags & nextTransactionFlag) != 0 && nextTransaction)
+         {
+            nextTransaction();
+         }
+         if ((flags & runQueueFlag) && runQueue)
+         {
+            runQueue();
+         }
+         if ((flags & hostConfigFlag) && hostConfig)
+         {
+            hostConfig();
+         }
+         if ((flags & shutdownFlag) && shutdown)
+         {
+            shutdown();
+         }
+         flags = 0;
+      }
+   };
 
    struct SharedDatabaseImpl;
    struct SharedDatabase
@@ -29,25 +108,50 @@ namespace psibase
       std::shared_ptr<SharedDatabaseImpl> impl;
 
       SharedDatabase() = default;
-      SharedDatabase(const boost::filesystem::path& dir,
-                     bool                           allowSlow,
-                     uint64_t                       max_objects    = 1'000'000'000ul,
-                     uint64_t                       hot_addr_bits  = 32,
-                     uint64_t                       warm_addr_bits = 32,
-                     uint64_t                       cool_addr_bits = 32,
-                     uint64_t                       cold_addr_bits = 38);
+      SharedDatabase(const std::filesystem::path&     dir,
+                     const triedent::database_config& config,
+                     triedent::open_mode              mode = triedent::open_mode::create);
       SharedDatabase(const SharedDatabase&) = default;
       SharedDatabase(SharedDatabase&&)      = default;
 
       SharedDatabase& operator=(const SharedDatabase&) = default;
       SharedDatabase& operator=(SharedDatabase&&)      = default;
 
+      // Returns a fork of the database.
+      // Warning: this should only be used for temporary databases as
+      // the storage is shared.
+      SharedDatabase clone() const;
+
       ConstRevisionPtr getHead();
+      ConstRevisionPtr emptyRevision();
       WriterPtr        createWriter();
       void             setHead(Writer& writer, ConstRevisionPtr revision);
       ConstRevisionPtr getRevision(Writer& writer, const Checksum256& blockId);
       void             removeRevisions(Writer& writer, const Checksum256& irreversible);
-      bool             isSlow() const;
+
+      void kvPutSubjective(Writer&               writer,
+                           DbId                  db,
+                           std::span<const char> key,
+                           std::span<const char> value);
+      void kvRemoveSubjective(Writer& writer, DbId db, std::span<const char> key);
+      std::optional<std::vector<char>> kvGetSubjective(Writer&               writer,
+                                                       DbId                  db,
+                                                       std::span<const char> key);
+
+      IndependentRevision getSubjective();
+      bool                commitSubjective(Writer&                writer,
+                                           IndependentRevision&   original,
+                                           IndependentRevision    updated,
+                                           IndependentChangeSet&& changes,
+                                           SocketChangeSet&&      socketChanges,
+                                           Sockets&               sockets,
+                                           SocketAutoCloseSet&    closing);
+
+      bool                               isSlow() const;
+      std::vector<std::span<const char>> span() const;
+
+      void               setCallbacks(DatabaseCallbacks*);
+      DatabaseCallbacks* getCallbacks() const;
    };
 
    struct DatabaseImpl;
@@ -119,6 +223,27 @@ namespace psibase
       ConstRevisionPtr writeRevision(Session& session, const Checksum256& blockId);
       void             abort(Session&);
 
+      ConstRevisionPtr getPrevAuthServices();
+      void             setPrevAuthServices(ConstRevisionPtr revision);
+
+      // Manage access to subjective database
+      void checkoutEmptySubjective();
+      void checkoutSubjective();
+      bool commitSubjective(Sockets& sockets, SocketAutoCloseSet& closing);
+      void abortSubjective();
+      // sockets options are linked to subjective checkouts. Eventually the state might
+      // be exposed in a table.
+      std::int32_t socketSetFlags(std::int32_t        socket,
+                                  std::uint32_t       mask,
+                                  std::uint32_t       value,
+                                  Sockets&            sockets,
+                                  SocketAutoCloseSet& closing);
+      // Used to ensure that checkout and commit are run in the same action
+      std::size_t saveSubjective();
+      void        restoreSubjective(std::size_t depth);
+
+      void clearTemporary();
+
       // TODO: kvPutRaw, kvRemoveRaw: return deltas
       // TODO: getters: pass in input buffers instead of returning KVResult
 
@@ -138,13 +263,19 @@ namespace psibase
          kvPutRaw(db, psio::convert_to_key(key), psio::convert_to_frac(value));
       }
 
+      template <typename K>
+      void kvRemove(DbId db, const K& key)
+      {
+         kvRemoveRaw(db, psio::convert_to_key(key));
+      }
+
       template <typename V, typename K>
       std::optional<V> kvGet(DbId db, const K& key)
       {
          auto s = kvGetRaw(db, psio::convert_to_key(key));
          if (!s)
             return std::nullopt;
-         return psio::convert_from_frac<V>(psio::input_stream(s->pos, s->end));
+         return psio::from_frac<V>(psio::prevalidated{s->pos, s->end});
       }
 
       template <typename V, typename K>
@@ -155,5 +286,7 @@ namespace psibase
             return std::move(*obj);
          return {};
       }
+
+      void setCallbackFlags(DatabaseCallbacks::Flags);
    };  // Database
 }  // namespace psibase

@@ -1,0 +1,30 @@
+[package]
+name = "chainmail_package"
+description = "Message-sending application"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[package.metadata.psibase]
+package-name = "Chainmail"
+services = ["chainmail"]
+
+[package.metadata.psibase.dependencies]
+HttpServer = "0.23.0"
+Supervisor = "0.23.0"
+Events = "0.23.0"
+SetCode = "0.23.0"
+Accounts = "0.23.0"
+CommonApi = "0.23.0"
+Sites = "0.23.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+chainmail = { path = "service", version = "0.23.0" }
+chainmail-plugin = { path = "plugin", version = "0.23.0" }
+psibase-user-workspace-hack.workspace = true

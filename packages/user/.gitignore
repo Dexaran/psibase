@@ -1,0 +1,12 @@
+node_modules
+**/dist
+results
+.nyc_output
+*.tsbuildinfo
+*.tmp
+storybook-static
+
+.env.local
+.idea
+.DS_Store
+target

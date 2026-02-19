@@ -1,583 +1,388 @@
-use crate::reflect::{
-    ArgVisitor, EnumVisitor, MethodsVisitor, NamedVisitor, Reflect, StructVisitor, UnnamedVisitor,
-    Visitor,
+use crate::{AccountNumber, DbId, MethodNumber};
+use fracpack::{
+    AnyType, CompiledSchema, CompiledType, CustomHandler, CustomTypes, FracInputStream,
+    FunctionType, Pack, SchemaBuilder, ToSchema, Unpack, VisitTypes,
 };
-use crate::Hex;
-use psibase_macros::Reflect;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::{any::TypeId, borrow::Cow, cell::RefCell, collections::HashMap, rc::Rc};
+use std::hash::Hash;
 
-#[derive(Debug, Clone, Default, Reflect, Serialize, Deserialize)]
-#[reflect(psibase_mod = "crate")]
-#[allow(non_snake_case)]
-pub struct Schema<String>
-where
-    String: Reflect,
-{
-    pub userTypes: Vec<Definition<String>>,
+#[derive(Debug, Clone, Serialize, Deserialize, Pack, Unpack, ToSchema)]
+#[fracpack(fracpack_mod = "fracpack")]
+pub struct MethodString(pub String);
+
+impl PartialEq for MethodString {
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .parse::<MethodNumber>()
+            .unwrap()
+            .eq(&other.0.parse::<MethodNumber>().unwrap())
+    }
 }
 
-#[derive(Debug, Clone, Default, Reflect, Serialize, Deserialize)]
-#[reflect(psibase_mod = "crate")]
-#[allow(non_snake_case)]
-pub struct Definition<String>
-where
-    String: Reflect,
-{
-    pub name: String,
+impl Eq for MethodString {}
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub alias: Option<TypeRef<String>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub structFields: Option<Vec<Field<String>>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unionFields: Option<Vec<Field<String>>>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub customJson: Option<bool>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub definitionWillNotChange: Option<bool>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub methods: Option<Vec<Method<String>>>,
+impl Hash for MethodString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.parse::<MethodNumber>().unwrap().hash(state)
+    }
 }
 
-#[derive(Debug, Clone, Reflect, Serialize, Deserialize)]
-#[reflect(psibase_mod = "crate")]
-#[allow(non_camel_case_types)]
-pub enum TypeRef<String>
-where
-    String: Reflect,
-{
-    ty(String),
-    user(String),
-    vector(Box<TypeRef<String>>),
-    option(Box<TypeRef<String>>),
-    tuple(Vec<TypeRef<String>>),
-    array(Box<TypeRef<String>>, u32),
-    hex(u32),
+impl std::fmt::Display for MethodString {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        self.0.fmt(f)
+    }
 }
 
-#[derive(Debug, Clone, Reflect, Serialize, Deserialize)]
-#[reflect(psibase_mod = "crate")]
-#[allow(non_snake_case)]
-pub struct Field<String>
-where
-    String: Reflect,
-{
-    name: String,
-    ty: TypeRef<String>,
+type EventMap = IndexMap<MethodString, AnyType>;
+
+type ActionMap = IndexMap<MethodString, FunctionType>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Pack, Unpack, PartialEq, Eq, ToSchema)]
+#[fracpack(fracpack_mod = "fracpack")]
+pub struct FieldId {
+    pub path: Vec<u32>,
+    pub transform: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<AnyType>,
 }
 
-#[derive(Debug, Clone, Reflect, Serialize, Deserialize)]
-#[reflect(psibase_mod = "crate")]
-#[allow(non_snake_case)]
-pub struct Method<String>
-where
-    String: Reflect,
-{
-    name: String,
-    returns: TypeRef<String>,
-    args: Vec<Field<String>>,
+impl VisitTypes for FieldId {
+    fn visit_types<F: FnMut(&mut AnyType) -> ()>(&mut self, f: &mut F) {
+        self.type_.visit_types(f);
+    }
 }
 
-type BuildString = Rc<RefCell<Cow<'static, str>>>;
+pub type IndexInfo = Vec<FieldId>;
 
-fn extract_str(str: &BuildString) -> String {
-    Rc::make_mut(&mut str.clone()).take().into_owned()
+#[derive(Debug, Clone, Serialize, Deserialize, Pack, Unpack, PartialEq, Eq, ToSchema)]
+#[fracpack(fracpack_mod = "fracpack")]
+pub struct TableInfo {
+    pub name: Option<String>,
+    pub table: u16,
+    #[serde(rename = "type")]
+    pub type_: AnyType,
+    pub indexes: Vec<IndexInfo>,
 }
 
-pub fn create_schema<T: Reflect>() -> Schema<BuildString> {
-    let mut builder: SchemaBuilder = Default::default();
-    builder.get_type_ref::<T>(false);
-    let mut names: HashSet<String> = HashSet::new();
-    for shared_name in builder.names {
-        let name = extract_str(&shared_name);
-        if names.contains(&name) {
-            let mut i = 0;
-            let new_name = loop {
-                let n = format!("{}{}", &name, i);
-                if !names.contains(&n) {
-                    break n;
+impl VisitTypes for TableInfo {
+    fn visit_types<F: FnMut(&mut AnyType) -> ()>(&mut self, f: &mut F) {
+        self.type_.visit_types(f);
+        self.indexes.visit_types(f);
+    }
+}
+
+pub fn db_name(db: DbId) -> String {
+    match db {
+        DbId::Service => "service".to_string(),
+        DbId::Subjective => "subjective".to_string(),
+        DbId::WriteOnly => "writeOnly".to_string(),
+        _ => panic!("Unsupported db"),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Pack, Unpack, PartialEq, Eq, ToSchema)]
+#[fracpack(fracpack_mod = "fracpack")]
+pub struct Schema {
+    pub service: AccountNumber,
+    pub types: fracpack::Schema,
+    pub actions: ActionMap,
+    pub ui: EventMap,
+    pub history: EventMap,
+    pub merkle: EventMap,
+    pub database: Option<IndexMap<String, Vec<TableInfo>>>,
+}
+
+#[cfg(test)]
+pub(crate) fn assert_schemas_equivalent(lhs: &Schema, rhs: &Schema) {
+    let mut matcher = fracpack::SchemaMatcher::new(
+        &lhs.types,
+        &rhs.types,
+        fracpack::SchemaDifference::EQUIVALENT,
+    );
+    for (name, lty) in &lhs.actions {
+        if let Some(rty) = rhs.actions.get(name) {
+            if !matcher.compare(&lty.params, &rty.params) {
+                panic!("Parameter types for action {} do not match", name);
+            }
+            match (&lty.result, &rty.result) {
+                (Some(lres), Some(rres)) => {
+                    if !matcher.compare(lres, rres) {
+                        panic!("Return type for {} does not match", name);
+                    }
                 }
-                i += 1;
-            };
-            shared_name.replace(new_name.clone().into());
-            names.insert(new_name);
+                (None, None) => (),
+                (Some(..), None) => panic!("Missing return type for {}", name),
+                (None, Some(..)) => panic!("Extra return type for {}", name),
+            }
         } else {
-            names.insert(name);
+            panic!("Missing action {}", name);
         }
     }
-    builder.schema
-}
-
-#[derive(Default)]
-struct SchemaBuilder {
-    names: Vec<BuildString>,
-    type_refs: HashMap<TypeId, TypeRef<BuildString>>,
-    schema: Schema<BuildString>,
-}
-
-impl SchemaBuilder {
-    fn get_type_ref<T: Reflect>(&mut self, for_return: bool) -> TypeRef<BuildString> {
-        let type_id = TypeId::of::<T::StaticType>();
-        if let Some(tr) = self.type_refs.get(&type_id) {
-            tr.clone()
-        } else {
-            T::StaticType::reflect(TypeBuilder {
-                schema_builder: self,
-                for_return,
-                custom_json: None,
-                definition_will_not_change: None,
-            })
+    for name in rhs.actions.keys() {
+        if !lhs.actions.contains_key(name) {
+            panic!("Extra action {}", name);
         }
     }
-
-    fn insert<T: Reflect>(
-        &mut self,
-        name: Option<BuildString>,
-        type_ref: TypeRef<BuildString>,
-    ) -> &TypeRef<BuildString> {
-        self.type_refs
-            .entry(TypeId::of::<T::StaticType>())
-            .or_insert_with(|| {
-                if let Some(name) = name {
-                    self.names.push(name);
+    for (levents, revents) in [
+        (&lhs.ui, &rhs.ui),
+        (&lhs.history, &rhs.history),
+        (&lhs.merkle, &rhs.merkle),
+    ] {
+        for (name, lty) in levents {
+            if let Some(rty) = revents.get(name) {
+                if !matcher.compare(lty, rty) {
+                    panic!("Type for event {} does not match", name);
                 }
-                type_ref
-            })
-    }
-}
-
-struct TypeBuilder<'a> {
-    schema_builder: &'a mut SchemaBuilder,
-    for_return: bool,
-    custom_json: Option<bool>,
-    definition_will_not_change: Option<bool>,
-}
-
-impl<'a> Visitor for TypeBuilder<'a> {
-    type Return = TypeRef<BuildString>;
-    type TupleVisitor = TupleBuilder<'a>;
-    type StructTupleVisitor = StructTupleBuilder<'a>;
-    type StructVisitor = StructBuilder<'a>;
-    type EnumVisitor = EnumBuilder<'a>;
-
-    fn custom_json(mut self) -> Self {
-        self.custom_json = Some(true);
-        self
-    }
-
-    fn definition_will_not_change(mut self) -> Self {
-        self.definition_will_not_change = Some(true);
-        self
-    }
-
-    fn unit(self) -> Self::Return {
-        if self.for_return {
-            TypeRef::ty(Rc::new(RefCell::new("void".into())))
-        } else {
-            TypeRef::tuple(Vec::new())
+            } else {
+                panic!("Missing event {}", name)
+            }
+        }
+        for name in revents.keys() {
+            if !levents.contains_key(name) {
+                panic!("Extra event {}", name);
+            }
         }
     }
+    // Allow tables to be missing
+    if let Some(rdb) = &rhs.database {
+        for (db, rtables) in rdb {
+            let empty_tables = Vec::new();
+            let ltables = lhs
+                .database
+                .as_ref()
+                .and_then(|tables| tables.get(db))
+                .unwrap_or(&empty_tables);
+            // Compare tables by their declared numeric `table` index
+            let l_by_idx: std::collections::HashMap<u16, &TableInfo> =
+                ltables.iter().map(|t| (t.table, t)).collect();
 
-    fn builtin<T: Reflect>(self, name: &'static str) -> Self::Return {
-        let name = Rc::new(RefCell::new(name.into()));
-        self.schema_builder
-            .insert::<T>(Some(name.clone()), TypeRef::ty(name))
-            .clone()
-    }
+            for rtab in rtables {
+                let Some(ltab) = l_by_idx.get(&rtab.table) else {
+                    let table_name = rtab.name.as_ref().map_or("<unnamed>", |n| n.as_str());
+                    panic!("Extra table {}::{} (index {})", db, table_name, rtab.table);
+                };
 
-    fn refed<Inner: Reflect>(self) -> Self::Return {
-        self.schema_builder.get_type_ref::<Inner>(false)
-    }
-
-    fn mut_ref<Inner: Reflect>(self) -> Self::Return {
-        self.schema_builder.get_type_ref::<Inner>(false)
-    }
-
-    fn boxed<Inner: Reflect>(self) -> Self::Return {
-        self.schema_builder.get_type_ref::<Inner>(false)
-    }
-
-    fn rc<Inner: Reflect>(self) -> Self::Return {
-        self.schema_builder.get_type_ref::<Inner>(false)
-    }
-
-    fn arc<Inner: Reflect>(self) -> Self::Return {
-        self.schema_builder.get_type_ref::<Inner>(false)
-    }
-
-    fn cell<Inner: Reflect>(self) -> Self::Return {
-        self.schema_builder.get_type_ref::<Inner>(false)
-    }
-
-    fn ref_cell<Inner: Reflect>(self) -> Self::Return {
-        self.schema_builder.get_type_ref::<Inner>(false)
-    }
-
-    fn option<Inner: Reflect>(self) -> Self::Return {
-        let inner = self.schema_builder.get_type_ref::<Inner>(false);
-        self.schema_builder
-            .insert::<Option<Inner>>(None, TypeRef::option(Box::new(inner)))
-            .clone()
-    }
-
-    fn container<T: Reflect, Inner: Reflect>(self) -> Self::Return {
-        let inner = self.schema_builder.get_type_ref::<Inner>(false);
-        self.schema_builder
-            .insert::<T>(None, TypeRef::vector(Box::new(inner)))
-            .clone()
-    }
-
-    fn array<Inner: Reflect, const SIZE: usize>(self) -> Self::Return {
-        let inner = self.schema_builder.get_type_ref::<Inner>(false);
-        self.schema_builder
-            .insert::<[Inner; SIZE]>(None, TypeRef::array(Box::new(inner), SIZE as u32))
-            .clone()
-    }
-
-    fn hex<const SIZE: usize>(self) -> Self::Return {
-        self.schema_builder
-            .insert::<Hex<[u8; SIZE]>>(None, TypeRef::hex(SIZE as u32))
-            .clone()
-    }
-
-    fn tuple<T: Reflect>(self, fields_len: usize) -> TupleBuilder<'a> {
-        TupleBuilder {
-            schema_builder: self.schema_builder,
-            fields: Vec::with_capacity(fields_len),
-            type_id: TypeId::of::<T::StaticType>(),
-        }
-    }
-
-    fn struct_single<T: Reflect, Inner: Reflect>(self, name: Cow<'static, str>) -> Self::Return {
-        let inner = self.schema_builder.get_type_ref::<Inner>(false);
-        let name = Rc::new(RefCell::new(name));
-        self.schema_builder.schema.userTypes.push(Definition {
-            name: name.clone(),
-            alias: Some(inner),
-            structFields: None,
-            unionFields: None,
-            customJson: None,
-            definitionWillNotChange: None,
-            methods: None,
-        });
-        self.schema_builder
-            .insert::<T>(Some(name.clone()), TypeRef::user(name))
-            .clone()
-    }
-
-    fn struct_tuple<T: Reflect>(
-        self,
-        name: Cow<'static, str>,
-        fields_len: usize,
-    ) -> Self::StructTupleVisitor {
-        let name = Rc::new(RefCell::new(name));
-        let type_ref = self
-            .schema_builder
-            .insert::<T>(Some(name.clone()), TypeRef::user(name.clone()))
-            .clone();
-        StructTupleBuilder {
-            schema_builder: self.schema_builder,
-            name,
-            type_ref,
-            fields: Vec::with_capacity(fields_len),
-        }
-    }
-
-    fn struct_named<T: Reflect>(
-        self,
-        name: Cow<'static, str>,
-        fields_len: usize,
-    ) -> Self::StructVisitor {
-        let name = Rc::new(RefCell::new(name));
-        let type_ref = self
-            .schema_builder
-            .insert::<T>(Some(name.clone()), TypeRef::user(name.clone()))
-            .clone();
-        StructBuilder {
-            schema_builder: self.schema_builder,
-            name,
-            type_ref,
-            custom_json: self.custom_json,
-            definition_will_not_change: self.definition_will_not_change,
-            fields: Vec::with_capacity(fields_len),
-            methods: None,
-        }
-    }
-
-    fn enumeration<T: Reflect>(
-        self,
-        name: Cow<'static, str>,
-        fields_len: usize,
-    ) -> Self::EnumVisitor {
-        let name = Rc::new(RefCell::new(name));
-        let type_ref = self
-            .schema_builder
-            .insert::<T>(Some(name.clone()), TypeRef::user(name.clone()))
-            .clone();
-        EnumBuilder {
-            schema_builder: self.schema_builder,
-            name,
-            type_ref,
-            fields: Vec::with_capacity(fields_len),
+                let table_name = ltab
+                    .name
+                    .as_ref()
+                    .or(rtab.name.as_ref())
+                    .map_or("<unnamed>", |n| n.as_str());
+                if !matcher.compare(&ltab.type_, &rtab.type_) {
+                    panic!("Type for table {}::{} does not match", db, table_name);
+                }
+                if ltab.indexes.len() < rtab.indexes.len() {
+                    panic!("Too many indexes for table {}::{}", db, table_name);
+                }
+                for (lindex, rindex) in std::iter::zip(&ltab.indexes, &rtab.indexes) {
+                    if lindex.len() != rindex.len() {
+                        panic!("Index does not match in {}::{}", db, table_name);
+                    }
+                    for (lfield, rfield) in std::iter::zip(lindex, rindex) {
+                        let tymatch = match (&lfield.type_, &rfield.type_) {
+                            (Some(lty), Some(rty)) => matcher.compare(lty, rty),
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if !tymatch
+                            || &lfield.path != &rfield.path
+                            || lfield.transform != rfield.transform
+                        {
+                            panic!("Index does not match in {}::{}", db, table_name);
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
-struct TupleBuilder<'a> {
-    schema_builder: &'a mut SchemaBuilder,
-    fields: Vec<TypeRef<BuildString>>,
-    type_id: TypeId,
+#[cfg(test)]
+pub(crate) fn assert_schema_matches_package<Wrapper: ToServiceSchema>() {
+    use crate::{DirectoryRegistry, PackageRegistry, SchemaMap};
+    use futures::executor::block_on;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    let my_schema = Wrapper::schema();
+    let registry = DirectoryRegistry::new(
+        PathBuf::from(std::env::var("PSIBASE_DATADIR").unwrap()).join("packages"),
+    );
+    let info = registry
+        .index()
+        .unwrap()
+        .into_iter()
+        .find(|info| info.accounts.contains(&my_schema.service))
+        .expect(&format!(
+            "Cannot find package containing {}",
+            my_schema.service
+        ));
+    let package = block_on(registry.get_by_info(&info)).unwrap();
+    let mut accounts = HashSet::new();
+    accounts.insert(my_schema.service);
+    let mut schemas = SchemaMap::new();
+    package.get_schemas(&mut accounts, &mut schemas).unwrap();
+    let real_schema = schemas.get(&my_schema.service).unwrap();
+    assert_schemas_equivalent(real_schema, &my_schema);
 }
 
-impl<'a> UnnamedVisitor<TypeRef<BuildString>> for TupleBuilder<'a> {
-    fn field<T: Reflect>(mut self) -> Self {
-        self.fields
-            .push(self.schema_builder.get_type_ref::<T>(false));
-        self
-    }
-
-    fn end(self) -> TypeRef<BuildString> {
-        self.schema_builder
-            .type_refs
-            .entry(self.type_id)
-            .or_insert(TypeRef::tuple(self.fields))
-            .clone()
-    }
+pub trait ToActionsSchema {
+    fn to_schema(builder: &mut SchemaBuilder) -> IndexMap<MethodString, FunctionType>;
 }
 
-struct StructTupleBuilder<'a> {
-    schema_builder: &'a mut SchemaBuilder,
-    name: BuildString,
-    type_ref: TypeRef<BuildString>,
-    fields: Vec<TypeRef<BuildString>>,
+pub trait ToEventsSchema {
+    fn to_schema(builder: &mut SchemaBuilder) -> IndexMap<MethodString, AnyType>;
 }
 
-impl<'a> UnnamedVisitor<TypeRef<BuildString>> for StructTupleBuilder<'a> {
-    fn field<T: Reflect>(mut self) -> Self {
-        self.fields
-            .push(self.schema_builder.get_type_ref::<T>(false));
-        self
-    }
-
-    fn end(self) -> TypeRef<BuildString> {
-        self.schema_builder.schema.userTypes.push(Definition {
-            name: self.name,
-            alias: Some(TypeRef::tuple(self.fields)),
-            structFields: None,
-            unionFields: None,
-            customJson: None,
-            definitionWillNotChange: None,
-            methods: None,
-        });
-        self.type_ref
-    }
+pub trait ToIndexSchema {
+    fn to_schema(builder: &mut SchemaBuilder) -> Vec<IndexInfo>;
 }
 
-struct StructBuilder<'a> {
-    schema_builder: &'a mut SchemaBuilder,
-    name: BuildString,
-    type_ref: TypeRef<BuildString>,
-    custom_json: Option<bool>,
-    definition_will_not_change: Option<bool>,
-    fields: Vec<Field<BuildString>>,
-    methods: Option<Vec<Method<BuildString>>>,
+pub trait ToDatabaseSchema {
+    fn to_schema(builder: &mut SchemaBuilder) -> Option<IndexMap<String, Vec<TableInfo>>>;
 }
 
-impl<'a> NamedVisitor<TypeRef<BuildString>> for StructBuilder<'a> {
-    fn field<T: Reflect>(mut self, name: Cow<'static, str>) -> Self {
-        let name = Rc::new(RefCell::new(name));
-        self.fields.push(Field {
-            name,
-            ty: self.schema_builder.get_type_ref::<T>(false),
-        });
-        self
-    }
+pub struct EmptyDatabase;
 
-    fn end(self) -> TypeRef<BuildString> {
-        self.schema_builder.schema.userTypes.push(Definition {
-            name: self.name,
-            alias: None,
-            structFields: Some(self.fields),
-            unionFields: None,
-            customJson: self.custom_json,
-            definitionWillNotChange: self.definition_will_not_change,
-            methods: self.methods,
-        });
-        self.type_ref
+impl ToDatabaseSchema for EmptyDatabase {
+    fn to_schema(_builder: &mut SchemaBuilder) -> Option<IndexMap<String, Vec<TableInfo>>> {
+        Some(IndexMap::new())
     }
 }
 
-impl<'a> StructVisitor<TypeRef<BuildString>> for StructBuilder<'a> {
-    type MethodsVisitor = Self;
-
-    fn with_methods(mut self, num_methods: usize) -> Self {
-        self.methods = Some(Vec::with_capacity(num_methods));
-        self
-    }
-}
-
-impl<'a> MethodsVisitor<TypeRef<BuildString>> for StructBuilder<'a> {
-    type ArgVisitor = MethodBuilder<'a>;
-
-    fn method<MethodReturn: Reflect>(
-        self,
-        name: Cow<'static, str>,
-        num_args: usize,
-    ) -> Self::ArgVisitor {
-        let returns = self.schema_builder.get_type_ref::<MethodReturn>(true);
-        MethodBuilder {
-            struct_builder: self,
-            name: Rc::new(name.into()),
-            returns,
-            args: Vec::with_capacity(num_args),
+pub trait ToServiceSchema {
+    type UiEvents: ToEventsSchema;
+    type HistoryEvents: ToEventsSchema;
+    type MerkleEvents: ToEventsSchema;
+    type Actions: ToActionsSchema;
+    type Database: ToDatabaseSchema;
+    const SERVICE: AccountNumber;
+    fn schema() -> Schema {
+        let mut builder = SchemaBuilder::new();
+        let mut actions = Self::Actions::to_schema(&mut builder);
+        let mut ui = Self::UiEvents::to_schema(&mut builder);
+        let mut history = Self::HistoryEvents::to_schema(&mut builder);
+        let mut merkle = Self::MerkleEvents::to_schema(&mut builder);
+        let mut database = Self::Database::to_schema(&mut builder);
+        let types = builder.build_ext(&mut (
+            &mut actions,
+            &mut ui,
+            &mut history,
+            &mut merkle,
+            &mut database,
+        ));
+        Schema {
+            service: Self::SERVICE,
+            types,
+            actions,
+            ui,
+            history,
+            merkle,
+            database,
         }
     }
-
-    fn end(self) -> TypeRef<BuildString> {
-        <Self as NamedVisitor<TypeRef<BuildString>>>::end(self)
-    }
-}
-
-struct MethodBuilder<'a> {
-    struct_builder: StructBuilder<'a>,
-    name: BuildString,
-    returns: TypeRef<BuildString>,
-    args: Vec<Field<BuildString>>,
-}
-
-impl<'a> ArgVisitor<StructBuilder<'a>> for MethodBuilder<'a> {
-    fn arg<T: Reflect>(mut self, name: Cow<'static, str>) -> Self {
-        self.args.push(Field {
-            name: Rc::new(name.into()),
-            ty: self.struct_builder.schema_builder.get_type_ref::<T>(false),
-        });
-        self
-    }
-
-    fn end(mut self) -> StructBuilder<'a> {
-        self.struct_builder.methods.as_mut().unwrap().push(Method {
-            name: self.name,
-            returns: self.returns,
-            args: self.args,
-        });
-        self.struct_builder
-    }
-}
-
-struct EnumBuilder<'a> {
-    schema_builder: &'a mut SchemaBuilder,
-    name: BuildString,
-    type_ref: TypeRef<BuildString>,
-    fields: Vec<Field<BuildString>>,
-}
-
-impl<'a> EnumVisitor<TypeRef<BuildString>> for EnumBuilder<'a> {
-    type TupleVisitor = EnumTupleBuilder<'a>;
-    type NamedVisitor = EnumNamedBuilder<'a>;
-
-    fn single<T: Reflect, Inner: Reflect>(mut self, name: Cow<'static, str>) -> Self {
-        self.fields.push(Field {
-            name: Rc::new(RefCell::new(name)),
-            ty: self.schema_builder.get_type_ref::<Inner>(false),
-        });
-        self
-    }
-
-    fn tuple<T: Reflect>(self, name: Cow<'static, str>, fields_len: usize) -> Self::TupleVisitor {
-        EnumTupleBuilder {
-            enum_builder: self,
-            name: Rc::new(RefCell::new(name)),
-            fields: Vec::with_capacity(fields_len),
+    fn actions_schema() -> Schema {
+        let mut builder = SchemaBuilder::new();
+        let mut actions = Self::Actions::to_schema(&mut builder);
+        let types = builder.build_ext(&mut [&mut actions][..]);
+        Schema {
+            service: Self::SERVICE,
+            types,
+            actions,
+            ui: Default::default(),
+            history: Default::default(),
+            merkle: Default::default(),
+            database: Default::default(),
         }
     }
+}
 
-    fn named<T: Reflect>(self, name: Cow<'static, str>, fields_len: usize) -> Self::NamedVisitor {
-        EnumNamedBuilder {
-            enum_builder: self,
-            name: Rc::new(RefCell::new(name)),
-            fields: Vec::with_capacity(fields_len),
-        }
+struct CustomAccountNumber;
+
+impl CustomHandler for CustomAccountNumber {
+    fn matches(&self, schema: &CompiledSchema, ty: &CompiledType) -> bool {
+        matches!(
+            schema.unwrap_struct(ty),
+            CompiledType::Int {
+                bits: 64,
+                is_signed: false
+            }
+        )
     }
-
-    fn end(self) -> TypeRef<BuildString> {
-        self.schema_builder.schema.userTypes.push(Definition {
-            name: self.name,
-            alias: None,
-            structFields: None,
-            unionFields: Some(self.fields),
-            customJson: None,
-            definitionWillNotChange: None,
-            methods: None,
-        });
-        self.type_ref
+    fn frac2json(
+        &self,
+        _schema: &CompiledSchema,
+        _ty: &CompiledType,
+        src: &mut FracInputStream,
+        _allow_empty_container: bool,
+    ) -> Result<serde_json::Value, fracpack::Error> {
+        Ok(AccountNumber::new(u64::unpack(src)?).to_string().into())
+    }
+    fn json2frac(
+        &self,
+        _schema: &CompiledSchema,
+        _ty: &CompiledType,
+        val: &serde_json::Value,
+        dest: &mut Vec<u8>,
+    ) -> Result<(), serde_json::Error> {
+        Ok(AccountNumber::deserialize(val)?.pack(dest))
+    }
+    fn is_empty_container(&self, _ty: &CompiledType, _value: &serde_json::Value) -> bool {
+        false
     }
 }
 
-struct EnumTupleBuilder<'a> {
-    enum_builder: EnumBuilder<'a>,
-    name: BuildString,
-    fields: Vec<TypeRef<BuildString>>,
+struct CustomMethodNumber;
+
+impl CustomHandler for CustomMethodNumber {
+    fn matches(&self, schema: &CompiledSchema, ty: &CompiledType) -> bool {
+        matches!(
+            schema.unwrap_struct(ty),
+            CompiledType::Int {
+                bits: 64,
+                is_signed: false
+            }
+        )
+    }
+    fn frac2json(
+        &self,
+        _schema: &CompiledSchema,
+        _ty: &CompiledType,
+        src: &mut FracInputStream,
+        _allow_empty_container: bool,
+    ) -> Result<serde_json::Value, fracpack::Error> {
+        Ok(MethodNumber::new(u64::unpack(src)?).to_string().into())
+    }
+    fn json2frac(
+        &self,
+        _schema: &CompiledSchema,
+        _ty: &CompiledType,
+        val: &serde_json::Value,
+        dest: &mut Vec<u8>,
+    ) -> Result<(), serde_json::Error> {
+        Ok(MethodNumber::deserialize(val)?.pack(dest))
+    }
+    fn is_empty_container(&self, _ty: &CompiledType, _value: &serde_json::Value) -> bool {
+        false
+    }
 }
 
-impl<'a> UnnamedVisitor<EnumBuilder<'a>> for EnumTupleBuilder<'a> {
-    fn field<T: Reflect>(mut self) -> Self {
-        self.fields
-            .push(self.enum_builder.schema_builder.get_type_ref::<T>(false));
-        self
-    }
-
-    fn end(mut self) -> EnumBuilder<'a> {
-        self.enum_builder.fields.push(Field {
-            name: self.name,
-            ty: TypeRef::tuple(self.fields),
-        });
-        self.enum_builder
-    }
+pub fn schema_types() -> CustomTypes<'static> {
+    let mut result = fracpack::standard_types();
+    static ACCOUNT_NUMBER: CustomAccountNumber = CustomAccountNumber;
+    static METHOD_NUMBER: CustomMethodNumber = CustomMethodNumber;
+    result.insert("AccountNumber".to_string(), &ACCOUNT_NUMBER);
+    result.insert("MethodNumber".to_string(), &METHOD_NUMBER);
+    result
 }
 
-struct EnumNamedBuilder<'a> {
-    enum_builder: EnumBuilder<'a>,
-    name: BuildString,
-    fields: Vec<Field<BuildString>>,
+pub fn create_schema<T: ToServiceSchema>() -> Schema {
+    T::schema()
 }
 
-impl<'a> NamedVisitor<EnumBuilder<'a>> for EnumNamedBuilder<'a> {
-    fn field<T: Reflect>(mut self, name: Cow<'static, str>) -> Self {
-        self.fields.push(Field {
-            name: Rc::new(RefCell::new(name)),
-            ty: self.enum_builder.schema_builder.get_type_ref::<T>(false),
-        });
-        self
-    }
-
-    fn end(mut self) -> EnumBuilder<'a> {
-        let struct_name = Rc::new(RefCell::new(Cow::Owned(
-            extract_str(&self.enum_builder.name) + "::" + self.name.as_ref().borrow().as_ref(),
-        )));
-        self.enum_builder
-            .schema_builder
-            .schema
-            .userTypes
-            .push(Definition {
-                name: struct_name.clone(),
-                alias: None,
-                structFields: Some(self.fields),
-                unionFields: None,
-                customJson: None,
-                definitionWillNotChange: None,
-                methods: None,
-            });
-        self.enum_builder.fields.push(Field {
-            name: self.name,
-            ty: TypeRef::user(struct_name),
-        });
-        self.enum_builder
-    }
+pub fn print_schema_impl<T: ToServiceSchema>() {
+    println!(
+        "psibase-schema-gen-output: {}",
+        serde_json::to_string(&T::schema()).unwrap()
+    )
 }

@@ -1,49 +1,53 @@
 #pragma once
+#include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace psio
 {
 
    template <typename SrcIt, typename DestIt>
-   void hex(SrcIt begin, SrcIt end, DestIt dest)
+   void hex(SrcIt begin, SrcIt end, DestIt dest, std::optional<char> delimiter = std::nullopt)
    {
-      auto nibble = [&dest](uint8_t i)
+      auto nibble = [&dest](std::uint8_t i)
       {
          if (i <= 9)
             *dest++ = '0' + i;
          else
             *dest++ = 'A' + i - 10;
       };
+
+      bool first = true;
       while (begin != end)
       {
-         nibble(((uint8_t)*begin) >> 4);
-         nibble(((uint8_t)*begin) & 0xf);
+         if (!first && delimiter)
+            *dest++ = *delimiter;
+         first = false;
+
+         nibble(((std::uint8_t)*begin) >> 4);
+         nibble(((std::uint8_t)*begin) & 0xf);
          ++begin;
       }
    }
 
    template <typename SrcIt>
-   std::string hex(SrcIt begin, SrcIt end)
+   std::string hex(SrcIt begin, SrcIt end, std::optional<char> delimiter = std::nullopt)
    {
       std::string s;
-      s.reserve((end - begin) * 2);
-      hex(begin, end, std::back_inserter(s));
+      size_t      size = (end - begin) * 2;
+      if (delimiter && begin != end)
+         size += (end - begin - 1);
+      s.reserve(size);
+      hex(begin, end, std::back_inserter(s), delimiter);
       return s;
    }
 
-   inline std::string to_hex(const std::span<const char>& bytes)
+   inline std::string to_hex(const std::span<const char>& bytes,
+                             std::optional<char>          delimiter = std::nullopt)
    {
-      std::string out;
-      out.resize(bytes.size() * 2);
-      auto itr = out.begin();
-      for (uint8_t byte : bytes)
-      {
-         *itr = hex_digits[byte >> 4];
-         ++itr;
-         *itr = hex_digits[byte & 0x0f];
-         ++itr;
-      }
-      return out;
+      return hex(bytes.begin(), bytes.end(), delimiter);
    }
 
    inline bool from_hex(std::string_view h, std::vector<char>& bytes)
@@ -53,7 +57,7 @@ namespace psio
 
       auto begin     = h.begin();
       auto end       = h.end();
-      auto get_digit = [&](uint8_t& nibble)
+      auto get_digit = [&](std::uint8_t& nibble)
       {
          if (*begin >= '0' && *begin <= '9')
             nibble = *begin++ - '0';
@@ -67,7 +71,7 @@ namespace psio
       };
       while (begin != end)
       {
-         uint8_t h, l;
+         std::uint8_t h, l;
          if (!get_digit(h) || !get_digit(l))
             return false;
          *dest++ = (h << 4) | l;
